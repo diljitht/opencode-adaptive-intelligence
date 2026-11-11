@@ -1,18 +1,17 @@
 #!/usr/bin/env node
 /**
- * Install OpenCode Adaptive Intelligence into a standard OpenCode plugins
- * directory, where OpenCode discovers it automatically.
+ * Install OpenCode Adaptive Intelligence as a standalone package in a standard
+ * OpenCode plugins directory, where OpenCode discovers it automatically.
  *
  *   npm run setup                 # global:  ~/.config/opencode/plugins/<id>
  *   npm run setup -- --project    # project: ./.opencode/plugins/<id>
- *   npm run setup -- --copy       # copy files instead of symlinking
  *   npm run setup -- --dir <path> # explicit destination directory
  *   npm run uninstall             # remove the installed plugin directory
  *
- * The default install symlinks this clone into the plugins directory so edits
- * and `git pull` are picked up without reinstalling. Pass `--copy` for a
- * self-contained install that does not depend on keeping the clone around.
+ * The installer copies the plugin and installs its production dependencies in
+ * the destination. The cloned repository can be moved or deleted afterward.
  */
+import { spawnSync } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -29,10 +28,14 @@ const value = (name) => {
   return index >= 0 ? args[index + 1] : undefined
 }
 
-const copyMode = has("--copy")
 const removeMode = has("--remove")
 const projectMode = has("--project")
 const explicitDir = value("--dir")
+
+if (has("--dir") && !explicitDir) {
+  console.error("--dir requires a destination path.")
+  process.exit(1)
+}
 
 let target
 if (explicitDir) {
@@ -46,7 +49,14 @@ if (explicitDir) {
   target = path.join(configRoot, "plugins", PLUGIN_ID)
 }
 
-// Remove a previous install without following a symlink into the clone.
+// Never allow an explicit destination to delete the clone or one of its
+// parents when replacing an existing installation.
+const sourceFromTarget = path.relative(target, source)
+if (target === source || (sourceFromTarget && !sourceFromTarget.startsWith("..") && !path.isAbsolute(sourceFromTarget))) {
+  console.error("The install destination cannot be the repository or one of its parent directories.")
+  process.exit(1)
+}
+
 function clearExisting(destination) {
   try {
     const stat = fs.lstatSync(destination)
@@ -61,37 +71,57 @@ if (removeMode) {
   process.exit(0)
 }
 
-if (!fs.existsSync(path.join(source, "src", "index.ts"))) {
+if (!fs.existsSync(path.join(source, "src", "index.ts")) || !fs.existsSync(path.join(source, "package-lock.json"))) {
   console.error("Run this script from the opencode-adaptive-intelligence repository.")
   process.exit(1)
 }
-if (!fs.existsSync(path.join(source, "node_modules"))) {
-  console.warn("Warning: node_modules is missing. Run `npm install` first so the plugin's dependencies resolve.")
-}
 
-fs.mkdirSync(path.dirname(target), { recursive: true })
-clearExisting(target)
+const parent = path.dirname(target)
+const staging = path.join(parent, `.${PLUGIN_ID}.install-${process.pid}`)
+const entries = [
+  "src",
+  "scripts",
+  "index.ts",
+  "package.json",
+  "package-lock.json",
+  "README.md",
+  "RESEARCH.md",
+  "opencode.example.jsonc",
+  "LICENSE",
+]
 
-if (copyMode) {
-  const entries = ["src", "index.ts", "package.json", "README.md", "RESEARCH.md", "opencode.example.jsonc", "LICENSE"]
-  fs.mkdirSync(target, { recursive: true })
+fs.mkdirSync(parent, { recursive: true })
+clearExisting(staging)
+
+try {
+  fs.mkdirSync(staging, { recursive: true })
   for (const entry of entries) {
     const from = path.join(source, entry)
-    if (fs.existsSync(from)) fs.cpSync(from, path.join(target, entry), { recursive: true })
+    if (fs.existsSync(from)) fs.cpSync(from, path.join(staging, entry), { recursive: true })
   }
-  // Reuse the clone's installed dependencies instead of downloading them again.
-  const modules = path.join(source, "node_modules")
-  if (fs.existsSync(modules)) {
-    try { fs.symlinkSync(modules, path.join(target, "node_modules"), "dir") } catch { /* keep going */ }
-  }
-  console.log(`Copied plugin to ${target}`)
-} else {
-  fs.symlinkSync(source, target, "dir")
-  console.log(`Linked ${target} -> ${source}`)
+
+  console.log("Installing production dependencies...")
+  const npm = process.platform === "win32" ? "npm.cmd" : "npm"
+  const installed = spawnSync(npm, ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"], {
+    cwd: staging,
+    stdio: "inherit",
+  })
+  if (installed.error) throw installed.error
+  if (installed.status !== 0) throw new Error(`npm ci exited with status ${installed.status ?? "unknown"}`)
+
+  clearExisting(target)
+  fs.renameSync(staging, target)
+} catch (error) {
+  clearExisting(staging)
+  console.error(`Installation failed: ${error instanceof Error ? error.message : String(error)}`)
+  process.exit(1)
 }
 
+console.log(`Installed standalone plugin at ${target}`)
 console.log("")
 console.log("OpenCode discovers plugins in this directory automatically.")
 console.log("Restart OpenCode, or run /reload, if it is already running.")
+console.log("The cloned repository is no longer required for the installed plugin.")
+console.log("Run `npm run setup` again after pulling updates.")
 console.log("Optional settings can be added to opencode.json(c) as a plugins entry")
 console.log("with a `package` and `options` (see opencode.example.jsonc).")

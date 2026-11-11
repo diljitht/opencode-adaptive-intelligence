@@ -126,12 +126,11 @@ User task
 
 ## Installation
 
-Clone the repository and install dependencies:
+Clone the repository:
 
 ```sh
 git clone https://github.com/diljitht/opencode-adaptive-intelligence.git
 cd opencode-adaptive-intelligence
-npm install
 ```
 
 Install the plugin into the standard OpenCode plugins directory:
@@ -140,23 +139,24 @@ Install the plugin into the standard OpenCode plugins directory:
 npm run setup
 ```
 
-This links the clone into `~/.config/opencode/plugins/opencode-adaptive-intelligence`
-(honoring `XDG_CONFIG_HOME`). OpenCode discovers plugins in that directory
-automatically, so no `opencode.jsonc` edit is required. Restart OpenCode, or run
-`/reload`, if it is already running.
+This copies the plugin into `~/.config/opencode/plugins/opencode-adaptive-intelligence`
+(honoring `XDG_CONFIG_HOME`) and installs its production dependencies there.
+The result is standalone: the clone can be moved or deleted after setup.
+OpenCode discovers plugins in that directory automatically, so no
+`opencode.jsonc` edit is required. Restart OpenCode, or run `/reload`, if it is
+already running.
 
 Variants:
 
 ```sh
 npm run setup -- --project      # install into ./.opencode/plugins for one project
-npm run setup -- --copy         # copy files instead of symlinking the clone
 npm run setup -- --dir <path>   # install into an explicit directory
 npm run uninstall               # remove the installed plugin
 ```
 
-The default install symlinks the clone, so `git pull` and local edits take effect
-without reinstalling. Use `--copy` for a self-contained install that does not
-depend on keeping the clone around.
+Run `npm run setup` again after pulling updates. Installation is staged before
+the existing plugin is replaced, so a dependency-install failure leaves the
+current installation intact.
 
 To customize behavior, add a `plugins` entry with `package` and `options` to
 `~/.config/opencode/opencode.jsonc`. The relative path resolves from the config
