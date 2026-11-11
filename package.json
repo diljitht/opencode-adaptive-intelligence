@@ -1,0 +1,42 @@
+{
+  "name": "opencode-adaptive-intelligence",
+  "version": "0.1.0",
+  "description": "Self-improving OpenCode V2 intelligence layer for autonomous skill acquisition, adaptive decisions, private memory, error reduction, and token efficiency.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "index.ts",
+    "README.md",
+    "RESEARCH.md",
+    "opencode.example.jsonc",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode-plugin",
+    "adaptive-intelligence",
+    "agent-memory",
+    "self-improving",
+    "skills",
+    "token-optimization"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@opencode/plugin": "^2.2.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import=tsx --test test/*.test.ts"
+  }
+}

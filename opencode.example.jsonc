@@ -1,0 +1,25 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "./opencode-adaptive-intelligence",
+      "options": {
+        "autoLearn": true,
+        "autoSkills": true,
+        "adaptivePlanning": true,
+        "maxRecommendedSubagents": 4,
+        "contextSafetyReserve": 0.2,
+        "graphDepth": 2,
+        "maxEdges": 800,
+        "tokenOptimization": true,
+        "sensitiveDataProtection": true,
+        "localProviders": ["ollama", "lmstudio", "local"],
+        "outboundToolPatterns": ["webfetch", "websearch", "browser", "http", "request", "mcp"],
+        "recallCount": 3,
+        "recallCharacters": 1600,
+        "toolOutputCharacters": 6000,
+        "recentMessagesToKeep": 8
+      }
+    }
+  ]
+}
