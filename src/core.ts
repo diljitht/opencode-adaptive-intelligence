@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto"
+import * as fs from "node:fs"
+import * as path from "node:path"
 
 export type MemoryKind = "preference" | "decision" | "constraint" | "fact" | "failure" | "solution"
 export type MemoryRelation =
@@ -62,12 +64,21 @@ export interface MemoryEdge {
   updatedAt: string
 }
 
+export type SkillTier = "common" | "project"
+
+export interface SkillHistoryEntry {
+  version: number
+  at: string
+  note: string
+}
+
 export interface LearnedSkill {
   id: string
   name: string
   description: string
   content: string
   triggerTerms: string[]
+  /** Project that first learned the skill. */
   projectID: string
   version: number
   uses: number
@@ -76,6 +87,29 @@ export interface LearnedSkill {
   createdAt: string
   updatedAt: string
   evidenceMemoryIDs?: string[]
+  /** Applicability tags (project genres) used to surface the skill in similar projects. */
+  tags?: string[]
+  /** "common" = broadly useful and continuously refined; "project" = niche or project-specific. */
+  tier?: SkillTier
+  /** Projects where this skill has been learned, adopted, or used. */
+  projectIDs?: string[]
+  /** Short log of distilled improvements, newest last. */
+  history?: SkillHistoryEntry[]
+}
+
+/** A skill selected from the shared library for the current project. */
+export interface LibrarySkillCandidate {
+  skill: LearnedSkill
+  score: number
+  reason: SkillTier
+  similarity: number
+}
+
+/** Manifest for the common skill folder shared by every project. */
+export interface LibraryIndex {
+  version: 1
+  updatedAt: string
+  skills: LearnedSkill[]
 }
 
 export interface SessionCheckpoint {
@@ -130,6 +164,9 @@ export interface AdaptiveState {
     decisionSuccesses: number
     decisionFailures: number
     decisionInconclusive: number
+    librarySkills: number
+    libraryAdopted: number
+    libraryRefinements: number
   }
 }
 
@@ -159,6 +196,16 @@ export interface PluginOptions {
   maxRecommendedSubagents: number
   contextSafetyReserve: number
   maxDecisionHistory: number
+  /** Share learned skills through one common library folder across projects. */
+  sharedSkills: boolean
+  /** Minimum similarity before a learned procedure is merged into an existing skill. */
+  skillSimilarityThreshold: number
+  /** Uses across at least this many projects promote a skill to the common tier. */
+  commonSkillMinProjects: number
+  /** Successful uses that promote a skill to the common tier. */
+  commonSkillMinUses: number
+  /** Extra genre tags for this project, merged with tags detected from the project directory. */
+  projectTags: string[]
 }
 
 export const DEFAULT_OPTIONS: PluginOptions = {
@@ -187,6 +234,11 @@ export const DEFAULT_OPTIONS: PluginOptions = {
   maxRecommendedSubagents: 4,
   contextSafetyReserve: 0.2,
   maxDecisionHistory: 200,
+  sharedSkills: true,
+  skillSimilarityThreshold: 0.34,
+  commonSkillMinProjects: 2,
+  commonSkillMinUses: 3,
+  projectTags: [],
 }
 
 const STOP = new Set([
@@ -218,8 +270,27 @@ export function emptyState(): AdaptiveState {
       decisionSuccesses: 0,
       decisionFailures: 0,
       decisionInconclusive: 0,
+      librarySkills: 0,
+      libraryAdopted: 0,
+      libraryRefinements: 0,
     },
   }
+}
+
+/**
+ * Rebuild a stats record from persisted state, keeping only the counters this
+ * version understands. This drops stale keys left behind by earlier versions
+ * while preserving any accumulated values for the current counters.
+ */
+export function normalizeStats(raw: unknown): AdaptiveState["stats"] {
+  const stats = emptyState().stats
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return stats
+  const record = raw as Record<string, unknown>
+  for (const key of Object.keys(stats) as Array<keyof AdaptiveState["stats"]>) {
+    const parsed = Number(record[key])
+    if (Number.isFinite(parsed) && parsed >= 0) stats[key] = parsed
+  }
+  return stats
 }
 
 export function clamp(value: unknown, fallback: number, min: number, max: number): number {
@@ -259,6 +330,13 @@ export function readOptions(raw: unknown): PluginOptions {
     maxRecommendedSubagents: clamp(value.maxRecommendedSubagents, DEFAULT_OPTIONS.maxRecommendedSubagents, 0, 8),
     contextSafetyReserve: clamp(value.contextSafetyReserve, DEFAULT_OPTIONS.contextSafetyReserve, 0.1, 0.5),
     maxDecisionHistory: clamp(value.maxDecisionHistory, DEFAULT_OPTIONS.maxDecisionHistory, 20, 2_000),
+    sharedSkills: value.sharedSkills !== false && value.crossProjectSkills !== false,
+    skillSimilarityThreshold: clamp(value.skillSimilarityThreshold, DEFAULT_OPTIONS.skillSimilarityThreshold, 0, 1),
+    commonSkillMinProjects: clamp(value.commonSkillMinProjects, DEFAULT_OPTIONS.commonSkillMinProjects, 1, 20),
+    commonSkillMinUses: clamp(value.commonSkillMinUses, DEFAULT_OPTIONS.commonSkillMinUses, 1, 100),
+    projectTags: Array.isArray(value.projectTags)
+      ? value.projectTags.filter((item): item is string => typeof item === "string").map((item) => item.trim().toLowerCase()).filter(Boolean).slice(0, 32)
+      : [],
   }
 }
 
@@ -819,7 +897,439 @@ export function parseGeneratedJSON(text: string): Record<string, unknown> | null
   }
 }
 
-export function safeSkillID(input: string, projectID: string): string {
+/** Stable, project-independent identifier for a skill in the common library. */
+export function librarySkillID(input: string): string {
   const clean = input.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 42) || "learned-workflow"
-  return `adaptive-${clean}-${stableID("p", projectID).slice(-6)}`
+  return `adaptive-${clean}`
+}
+
+/** Token-overlap (Jaccard) similarity between two free-text fields; 0 when either is empty. */
+export function textSimilarity(left: string, right: string): number {
+  const a = new Set(tokenize(left))
+  const b = new Set(tokenize(right))
+  if (!a.size || !b.size) return 0
+  let shared = 0
+  for (const token of a) if (b.has(token)) shared++
+  const union = new Set([...a, ...b]).size
+  return union ? shared / union : 0
+}
+
+function stringList(value: unknown, max: number): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean).slice(0, max)
+    : []
+}
+
+function nonNegative(value: unknown, fallback: number): number {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
+}
+
+// ---------------------------------------------------------------------------
+// Common skill library
+//
+// Every project reads and writes one shared library folder. Learned procedures
+// are distilled into existing entries instead of duplicated, broadly useful
+// skills are promoted to the "common" tier, and project-specific skills stay
+// available to projects whose genre tags match. Nothing leaves the machine.
+// ---------------------------------------------------------------------------
+
+export function normalizeTag(value: string): string {
+  return value.trim().toLowerCase()
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+function readTextFile(file: string, max = 400_000): string {
+  try {
+    const stat = fs.statSync(file)
+    if (!stat.isFile() || stat.size > max) return ""
+    return fs.readFileSync(file, "utf8")
+  } catch {
+    return ""
+  }
+}
+
+function listEntries(directory: string): string[] {
+  try {
+    return fs.readdirSync(directory)
+  } catch {
+    return []
+  }
+}
+
+function isDirectory(directory: string, relative: string): boolean {
+  try {
+    return fs.statSync(path.join(directory, relative)).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+const JAVASCRIPT_DEPENDENCY_TAGS: Record<string, string[]> = {
+  react: ["react", "web"],
+  "react-dom": ["react", "web"],
+  next: ["nextjs", "web", "ssr"],
+  vue: ["vue", "web"],
+  nuxt: ["nuxt", "web", "ssr"],
+  svelte: ["svelte", "web"],
+  "@sveltejs/kit": ["svelte", "web", "ssr"],
+  "@angular/core": ["angular", "web"],
+  "solid-js": ["solid", "web"],
+  astro: ["astro", "web"],
+  electron: ["electron", "desktop"],
+  express: ["express", "server", "http"],
+  fastify: ["fastify", "server", "http"],
+  koa: ["koa", "server", "http"],
+  "@nestjs/core": ["nestjs", "server"],
+  prisma: ["prisma", "database"],
+  "@prisma/client": ["prisma", "database"],
+  tailwindcss: ["tailwind", "css"],
+  vite: ["vite", "build"],
+  webpack: ["webpack", "build"],
+  rollup: ["rollup", "build"],
+  esbuild: ["esbuild", "build"],
+  jest: ["jest", "testing"],
+  vitest: ["vitest", "testing"],
+  mocha: ["mocha", "testing"],
+  "@playwright/test": ["playwright", "testing"],
+  playwright: ["playwright", "testing"],
+  cypress: ["cypress", "testing"],
+  typescript: ["typescript"],
+  eslint: ["eslint", "lint"],
+  graphql: ["graphql", "api"],
+  "@apollo/client": ["graphql", "api"],
+  "socket.io": ["realtime"],
+  d3: ["visualization"],
+  three: ["3d", "graphics"],
+  mongodb: ["mongodb", "database"],
+  mongoose: ["mongodb", "database"],
+  pg: ["postgres", "database"],
+  postgres: ["postgres", "database"],
+  mysql2: ["mysql", "database"],
+  redis: ["redis", "cache"],
+  ioredis: ["redis", "cache"],
+  "@supabase/supabase-js": ["supabase", "backend"],
+  firebase: ["firebase", "backend"],
+  stripe: ["stripe", "payments"],
+  "@modelcontextprotocol/sdk": ["mcp"],
+  openai: ["ai", "llm"],
+  "@anthropic-ai/sdk": ["ai", "llm"],
+  langchain: ["ai", "llm"],
+  "@opencode-ai/sdk": ["opencode"],
+  "@opencode/plugin": ["opencode", "plugin"],
+  "react-native": ["react-native", "mobile"],
+  expo: ["expo", "mobile"],
+  "discord.js": ["discord", "bot"],
+  telegraf: ["telegram", "bot"],
+  grammy: ["telegram", "bot"],
+}
+
+const PYTHON_DEPENDENCY_TAGS: Record<string, string[]> = {
+  django: ["django", "web"],
+  flask: ["flask", "web"],
+  fastapi: ["fastapi", "api"],
+  starlette: ["starlette", "api"],
+  pandas: ["pandas", "data"],
+  numpy: ["numpy", "data"],
+  scipy: ["scipy", "data"],
+  torch: ["pytorch", "ml"],
+  tensorflow: ["tensorflow", "ml"],
+  "scikit-learn": ["sklearn", "ml"],
+  sklearn: ["sklearn", "ml"],
+  scrapy: ["scrapy", "scraping"],
+  celery: ["celery", "tasks"],
+  sqlalchemy: ["sqlalchemy", "database"],
+  pydantic: ["pydantic"],
+  pytest: ["pytest", "testing"],
+  streamlit: ["streamlit", "web"],
+  matplotlib: ["matplotlib", "visualization"],
+  jupyter: ["jupyter", "notebook"],
+  transformers: ["transformers", "ml"],
+  langchain: ["langchain", "ai", "llm"],
+}
+
+const GO_DEPENDENCY_TAGS: Record<string, string[]> = {
+  "gin-gonic/gin": ["gin", "web"],
+  "labstack/echo": ["echo", "web"],
+  "gofiber/fiber": ["fiber", "web"],
+  "gorm.io/gorm": ["gorm", "database"],
+}
+
+const RUST_DEPENDENCY_TAGS: Record<string, string[]> = {
+  axum: ["axum", "web"],
+  "actix-web": ["actix", "web"],
+  rocket: ["rocket", "web"],
+  tokio: ["tokio", "async"],
+  serde: ["serde"],
+  clap: ["cli"],
+  bevy: ["bevy", "game"],
+  tauri: ["tauri", "desktop"],
+  leptos: ["leptos", "web"],
+  yew: ["yew", "web"],
+  sqlx: ["sqlx", "database"],
+  diesel: ["diesel", "database"],
+}
+
+const RUBY_DEPENDENCY_TAGS: Record<string, string[]> = {
+  rails: ["rails", "web"],
+  sinatra: ["sinatra", "web"],
+  rspec: ["rspec", "testing"],
+}
+
+const PHP_DEPENDENCY_TAGS: Record<string, string[]> = {
+  "laravel/framework": ["laravel", "web"],
+  "symfony/framework-bundle": ["symfony", "web"],
+}
+
+function addTagsFromHints(text: string, hints: Record<string, string[]>, tags: Set<string>): void {
+  if (!text) return
+  const lower = text.toLowerCase()
+  for (const [dependency, mapped] of Object.entries(hints)) {
+    const matched = /[^a-z0-9_-]/.test(dependency)
+      ? lower.includes(dependency)
+      : new RegExp(`(^|[^a-z0-9_-])${escapeRegExp(dependency)}([^a-z0-9_-]|$)`, "i").test(lower)
+    if (matched) for (const tag of mapped) tags.add(tag)
+  }
+}
+
+/**
+ * Deterministically infer coarse project "genre" tags from marker files and
+ * manifests in the project directory. Best-effort and side-effect free.
+ */
+export function detectProjectTags(directory: string): string[] {
+  const tags = new Set<string>()
+  if (!directory) return []
+  const entries = listEntries(directory)
+  const names = new Set(entries)
+  const has = (name: string) => names.has(name)
+  const endsWith = (suffix: string) => entries.some((entry) => entry.endsWith(suffix))
+  const read = (name: string) => readTextFile(path.join(directory, name))
+
+  if (has("package.json")) {
+    tags.add("node")
+    tags.add("javascript")
+    addTagsFromHints(read("package.json"), JAVASCRIPT_DEPENDENCY_TAGS, tags)
+  }
+  if (has("tsconfig.json")) tags.add("typescript")
+  if (has("deno.json") || has("deno.jsonc")) { tags.add("deno"); tags.add("typescript") }
+  if (has("bun.lockb") || has("bun.lock") || has("bunfig.toml")) tags.add("bun")
+
+  if (has("pyproject.toml") || has("requirements.txt") || has("setup.py") || has("setup.cfg") || has("Pipfile") || has("poetry.lock") || has("uv.lock")) {
+    tags.add("python")
+    addTagsFromHints(read("pyproject.toml"), PYTHON_DEPENDENCY_TAGS, tags)
+    addTagsFromHints(read("requirements.txt"), PYTHON_DEPENDENCY_TAGS, tags)
+  }
+  if (has("go.mod")) { tags.add("go"); addTagsFromHints(read("go.mod"), GO_DEPENDENCY_TAGS, tags) }
+  if (has("Cargo.toml")) { tags.add("rust"); addTagsFromHints(read("Cargo.toml"), RUST_DEPENDENCY_TAGS, tags) }
+  if (has("pom.xml")) { tags.add("java"); tags.add("maven") }
+  if (has("build.gradle") || has("build.gradle.kts") || has("settings.gradle") || has("settings.gradle.kts")) tags.add("gradle")
+  if (has("build.gradle") || has("build.gradle.kts") || has("pom.xml")) tags.add("jvm")
+  if (has("AndroidManifest.xml") || isDirectory(directory, "app/src/main")) { tags.add("android"); tags.add("mobile") }
+  if (has("Gemfile")) { tags.add("ruby"); addTagsFromHints(read("Gemfile"), RUBY_DEPENDENCY_TAGS, tags) }
+  if (has("composer.json")) { tags.add("php"); addTagsFromHints(read("composer.json"), PHP_DEPENDENCY_TAGS, tags) }
+  if (has("pubspec.yaml")) { tags.add("dart"); tags.add("flutter"); tags.add("mobile") }
+  if (has("Package.swift") || endsWith(".xcodeproj") || endsWith(".xcworkspace")) { tags.add("swift"); tags.add("apple") }
+  if (has("mix.exs")) tags.add("elixir")
+  if (has("build.sbt")) tags.add("scala")
+  if (has("cpanfile")) tags.add("perl")
+  if (endsWith(".rockspec")) tags.add("lua")
+  if (has("CMakeLists.txt")) { tags.add("cmake"); tags.add("cpp") }
+  if (has("Makefile") || has("makefile")) tags.add("make")
+  if (has("Dockerfile") || has("docker-compose.yml") || has("docker-compose.yaml") || has("compose.yml") || has("compose.yaml")) tags.add("docker")
+  if (endsWith(".tf") || isDirectory(directory, "terraform")) tags.add("terraform")
+  if (isDirectory(directory, "k8s") || isDirectory(directory, "kubernetes") || isDirectory(directory, "helm") || isDirectory(directory, "charts")) tags.add("kubernetes")
+  if (isDirectory(directory, ".github/workflows")) tags.add("ci")
+  if (has("prisma/schema.prisma") || isDirectory(directory, "prisma")) tags.add("prisma")
+  if (endsWith(".graphql") || endsWith(".gql")) tags.add("graphql")
+  if (has(".eslintrc") || has(".eslintrc.js") || has(".eslintrc.cjs") || has("eslint.config.js") || has("eslint.config.mjs") || has("eslint.config.ts")) tags.add("eslint")
+
+  if (tags.has("react-native") || tags.has("expo") || tags.has("flutter") || tags.has("android")) tags.add("mobile")
+  if (tags.has("electron") || tags.has("tauri")) tags.add("desktop")
+
+  return [...tags].sort().slice(0, 32)
+}
+
+/** Jaccard similarity between two tag sets; 0 when either side is empty. */
+export function projectSimilarity(left: string[], right: string[]): number {
+  const a = new Set(left.map(normalizeTag).filter(Boolean))
+  const b = new Set(right.map(normalizeTag).filter(Boolean))
+  if (!a.size || !b.size) return 0
+  let shared = 0
+  for (const tag of a) if (b.has(tag)) shared++
+  const union = new Set([...a, ...b]).size
+  return union ? shared / union : 0
+}
+
+function ageInDays(iso: string): number {
+  const parsed = Date.parse(iso)
+  return Number.isFinite(parsed) ? Math.max(0, (Date.now() - parsed) / 86_400_000) : 365
+}
+
+/** Recompute whether a skill is broadly useful ("common") or project-specific. */
+export function computeSkillTier(
+  skill: LearnedSkill,
+  options: { commonMinProjects: number; commonMinUses: number },
+): SkillTier {
+  const projects = new Set((skill.projectIDs ?? [skill.projectID]).filter(Boolean)).size
+  const reliable = skill.failures <= skill.successes
+  if (projects >= options.commonMinProjects && reliable && skill.successes > 0) return "common"
+  if (skill.uses >= options.commonMinUses && reliable) return "common"
+  return "project"
+}
+
+/**
+ * Distill a newly observed procedure into an existing library skill. The richer
+ * procedure text wins, evidence and applicability metadata are unioned, and the
+ * version is bumped so later iterations build on earlier learning.
+ */
+export function mergeLibrarySkill(
+  existing: LearnedSkill,
+  incoming: {
+    name: string
+    description: string
+    content: string
+    triggerTerms: string[]
+    tags: string[]
+    projectID: string
+    evidenceMemoryIDs?: string[]
+    now: string
+  },
+): { refined: boolean } {
+  const incomingContent = incoming.content.trim()
+  const existingContent = (existing.content ?? "").trim()
+  let refined = false
+  if (incomingContent && (incomingContent.length > existingContent.length * 1.15 || !existingContent)) {
+    existing.content = incomingContent
+    refined = true
+  }
+  if (!existing.name) existing.name = incoming.name
+  if (incoming.description && incoming.description.length > (existing.description ?? "").length) {
+    existing.description = incoming.description
+  }
+  existing.triggerTerms = [...new Set([...(existing.triggerTerms ?? []), ...incoming.triggerTerms])].slice(0, 24)
+  existing.tags = [...new Set([...(existing.tags ?? []), ...incoming.tags])].slice(0, 32)
+  existing.projectIDs = [...new Set([...(existing.projectIDs ?? [existing.projectID]), incoming.projectID].filter(Boolean))]
+  existing.version = (existing.version ?? 1) + 1
+  existing.updatedAt = incoming.now
+  if (incoming.evidenceMemoryIDs?.length) {
+    existing.evidenceMemoryIDs = [...new Set([...(existing.evidenceMemoryIDs ?? []), ...incoming.evidenceMemoryIDs])].slice(-20)
+  }
+  existing.history = [
+    ...(existing.history ?? []),
+    { version: existing.version, at: incoming.now, note: refined ? "refined with a more complete procedure" : "confirmed and revalidated" },
+  ].slice(-20)
+  return { refined }
+}
+
+/** Validate and normalize the untrusted common-folder manifest read from disk. */
+export function parseLibraryIndex(value: unknown): LibraryIndex {
+  const empty: LibraryIndex = { version: 1, updatedAt: new Date(0).toISOString(), skills: [] }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return empty
+  const record = value as Record<string, unknown>
+  const rawSkills = Array.isArray(record.skills) ? record.skills : []
+  const skills: LearnedSkill[] = []
+  for (const raw of rawSkills.slice(0, 1_000)) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue
+    const skill = raw as Record<string, unknown>
+    const id = typeof skill.id === "string" ? skill.id : ""
+    const name = typeof skill.name === "string" ? skill.name : ""
+    const content = typeof skill.content === "string" ? skill.content : ""
+    if (!id || !name || !content) continue
+    const createdAt = typeof skill.createdAt === "string" ? skill.createdAt : new Date(0).toISOString()
+    const updatedAt = typeof skill.updatedAt === "string" ? skill.updatedAt : createdAt
+    const projectID = typeof skill.projectID === "string" ? skill.projectID : ""
+    const projectIDs = stringList(skill.projectIDs, 200)
+    if (projectID && !projectIDs.includes(projectID)) projectIDs.unshift(projectID)
+    skills.push({
+      id,
+      name,
+      description: typeof skill.description === "string" ? skill.description : "",
+      content,
+      triggerTerms: stringList(skill.triggerTerms, 24),
+      projectID,
+      version: Math.max(1, Math.floor(nonNegative(skill.version, 1))),
+      uses: Math.floor(nonNegative(skill.uses, 0)),
+      successes: Math.floor(nonNegative(skill.successes, 0)),
+      failures: Math.floor(nonNegative(skill.failures, 0)),
+      createdAt,
+      updatedAt,
+      evidenceMemoryIDs: stringList(skill.evidenceMemoryIDs, 20),
+      tags: stringList(skill.tags, 32).map(normalizeTag),
+      tier: skill.tier === "common" ? "common" : "project",
+      projectIDs,
+      history: Array.isArray(skill.history)
+        ? skill.history.slice(-20).map((entry) => {
+            const record = entry && typeof entry === "object" ? entry as Record<string, unknown> : {}
+            return {
+              version: Math.max(1, Math.floor(nonNegative(record.version, 1))),
+              at: typeof record.at === "string" ? record.at : createdAt,
+              note: typeof record.note === "string" ? record.note.slice(0, 200) : "",
+            }
+          })
+        : undefined,
+    })
+  }
+  return {
+    version: 1,
+    updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : new Date(0).toISOString(),
+    skills,
+  }
+}
+
+/** Parse a SKILL.md file written by this plugin; used to rebuild a missing manifest. */
+export function parseSkillMarkdown(
+  markdown: string,
+): { name: string; description: string; content: string; metadata: Record<string, string> } | null {
+  const normalized = markdown.replace(/^\uFEFF/, "").trimStart()
+  const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(normalized)
+  if (!match) return null
+  const front = match[1] ?? ""
+  const content = (match[2] ?? "").trim()
+  const metadata: Record<string, string> = {}
+  for (const line of front.split(/\r?\n/)) {
+    const entry = /^\s*([A-Za-z0-9_-]+):[ \t]*(.*)$/.exec(line)
+    if (entry?.[1]) metadata[entry[1]] = (entry[2] ?? "").trim()
+  }
+  const name = metadata.name ?? ""
+  if (!name || !content) return null
+  return { name, description: metadata.description ?? "", content, metadata }
+}
+
+/**
+ * Select the library skills that should be available in this project: broadly
+ * useful "common" skills plus project-specific skills whose applicability tags
+ * match the current project.
+ */
+export function selectLibrarySkills(
+  library: LearnedSkill[],
+  currentProjectID: string,
+  currentTags: string[],
+  options: { minSimilarity: number; maxSkills: number; commonMinProjects: number; commonMinUses: number },
+): LibrarySkillCandidate[] {
+  if (options.maxSkills <= 0) return []
+  const candidates: LibrarySkillCandidate[] = []
+  for (const skill of library) {
+    const tags = skill.tags ?? []
+    const similarity = currentTags.length && tags.length ? projectSimilarity(currentTags, tags) : 0
+    const known = (skill.projectIDs ?? [skill.projectID]).includes(currentProjectID)
+    const tier = skill.tier ?? computeSkillTier(skill, options)
+    const matches = known || similarity >= options.minSimilarity
+    if (tier !== "common" && !matches) continue
+    const recency = Math.max(0.7, Math.exp(-ageInDays(skill.updatedAt) / 365))
+    const attempts = skill.successes + skill.failures
+    const successRate = attempts > 0 ? skill.successes / attempts : 0.5
+    const score =
+      (tier === "common" ? 1.2 : 0) +
+      (known ? 1.0 : 0) +
+      similarity * 2 +
+      Math.min(skill.uses, 20) * 0.02 +
+      successRate * 0.3 -
+      Math.min(skill.failures, 10) * 0.03 +
+      recency * 0.1
+    candidates.push({ skill, score, reason: tier, similarity })
+  }
+  return candidates.sort((a, b) => b.score - a.score).slice(0, options.maxSkills)
 }

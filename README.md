@@ -62,13 +62,26 @@ A model-proposed `supersedes` relationship must be independently confirmed befor
 
 ### Learned OpenCode skills
 
-A reusable procedure may become a project-scoped native OpenCode skill only when the session demonstrates a non-obvious successful workflow. Learned skills:
+A reusable procedure may become a native OpenCode skill only when the session demonstrates a non-obvious successful workflow. Learned skills:
 
-- Are stored outside the project source tree
+- Are stored outside any project source tree, in one shared library
 - Retain links to supporting memories
 - Are registered through OpenCode's native skill API
 - Track usage and coarse success/failure evidence
 - Cannot edit project code or configuration by themselves
+
+### Common skill library
+
+Skills are learned by analyzing the problem at hand, then distilled and refined across iterations. They live in a **single shared library** in OpenCode's standard global skills directory so the same procedure is never researched from scratch twice.
+
+- The authoritative store is the standard global skills directory, `~/.config/opencode/skills/<id>/SKILL.md` (honoring `XDG_CONFIG_HOME`), indexed by the hidden manifest `~/.config/opencode/skills/.adaptive-intelligence.json`.
+- Every library skill is written to the standard skills directory. Skills selected for the current project are advertised to the model (`metadata.opencode/autoinvoke: true`); the rest stay registered but hidden (`false`). Skill visibility therefore reflects the project synced most recently.
+- When a session reveals a reusable procedure that is not already in the library, a new skill is created from the analysis. When a procedure is already present (matched by id or by at least 60% text similarity), the richer version is **merged into the existing skill** instead of creating a duplicate: the better procedure wins, applicability tags and evidence are unioned, the version is bumped, and a short refinement history is kept.
+- Skills carry coarse **genre tags** derived deterministically from marker files and manifests (for example `node`, `typescript`, `react`, `python`, `django`, `rust`, `go`, `docker`). Extra tags can be supplied with `projectTags`.
+- Two tiers keep the library useful without flooding a project: broadly useful, repeatedly successful skills are promoted to `common` and surfaced everywhere; niche skills stay `project`-scoped and are surfaced only in projects whose tags match (`skillSimilarityThreshold`, Jaccard over tag sets). At most `maxSkills` are registered in one project.
+- The library is read at session start and re-read on demand (`sync`), so skills learned by other projects become available without restarting.
+- Sharing is local-only; nothing is sent over the network. Sensitive-data detection still applies, so content that looks like a secret is rejected.
+- Disable with `sharedSkills: false`, which restricts the agent to skills learned in the current project.
 
 ### Context optimization
 
@@ -113,25 +126,51 @@ User task
 
 ## Installation
 
-Install dependencies and verify the plugin:
+Clone the repository and install dependencies:
 
 ```sh
+git clone https://github.com/diljitht/opencode-adaptive-intelligence.git
 cd opencode-adaptive-intelligence
 npm install
-npm run typecheck
-npm test
-npm run build
 ```
 
-Add the package directory to `opencode.jsonc`:
+Install the plugin into the standard OpenCode plugins directory:
+
+```sh
+npm run setup
+```
+
+This links the clone into `~/.config/opencode/plugins/opencode-adaptive-intelligence`
+(honoring `XDG_CONFIG_HOME`). OpenCode discovers plugins in that directory
+automatically, so no `opencode.jsonc` edit is required. Restart OpenCode, or run
+`/reload`, if it is already running.
+
+Variants:
+
+```sh
+npm run setup -- --project      # install into ./.opencode/plugins for one project
+npm run setup -- --copy         # copy files instead of symlinking the clone
+npm run setup -- --dir <path>   # install into an explicit directory
+npm run uninstall               # remove the installed plugin
+```
+
+The default install symlinks the clone, so `git pull` and local edits take effect
+without reinstalling. Use `--copy` for a self-contained install that does not
+depend on keeping the clone around.
+
+To customize behavior, add a `plugins` entry with `package` and `options` to
+`~/.config/opencode/opencode.jsonc`. The relative path resolves from the config
+file's directory:
 
 ```jsonc
 {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "./opencode-adaptive-intelligence",
-      "options": {}
+      "package": "./plugins/opencode-adaptive-intelligence",
+      "options": {
+        "sharedSkills": true
+      }
     }
   ]
 }
@@ -157,7 +196,7 @@ All options are optional.
 | `extractionMaxTokens` | `1200` | Maximum output tokens for a learning request. |
 | `maxMemories` | `200` | Maximum stored memories. |
 | `maxEdges` | `800` | Maximum stored memory relationships. |
-| `maxSkills` | `30` | Maximum learned skills. |
+| `maxSkills` | `30` | Maximum library skills registered in one project at once. |
 | `recallCount` | `3` | Maximum memories recalled per session. |
 | `recallCharacters` | `1600` | Maximum characters in the recalled evidence block. |
 | `minimumRecallScore` | `0.16` | Minimum lexical seed score for recall. |
@@ -170,6 +209,11 @@ All options are optional.
 | `sensitiveDataProtection` | `true` | Enable detection, persistence rejection, warnings, and pseudonymization. |
 | `localProviders` | See below | Provider IDs explicitly permitted to receive detected values locally. |
 | `outboundToolPatterns` | See below | Tool-name fragments treated as outbound network tools. |
+| `sharedSkills` | `true` | Share learned skills through one common library folder across projects. |
+| `skillSimilarityThreshold` | `0.34` | Minimum Jaccard similarity before a new procedure is merged into an existing skill. |
+| `commonSkillMinProjects` | `2` | Uses across at least this many projects promote a skill to the `common` tier. |
+| `commonSkillMinUses` | `3` | Successful uses that promote a skill to the `common` tier. |
+| `projectTags` | `[]` | Extra genre tags for this project, merged with tags detected from the project directory. |
 
 Default local providers:
 
@@ -190,7 +234,7 @@ Example configuration:
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "./opencode-adaptive-intelligence",
+      "package": "./plugins/opencode-adaptive-intelligence",
       "options": {
         "adaptivePlanning": true,
         "maxRecommendedSubagents": 3,
@@ -209,7 +253,9 @@ Example configuration:
 ## Storage
 
 - Structured adaptive state is stored through OpenCode's plugin-scoped storage.
-- Generated skills are stored under `~/.local/share/opencode/adaptive-intelligence/<project-id>/skills/`.
+- The plugin is installed into the standard plugins directory, `~/.config/opencode/plugins/opencode-adaptive-intelligence` (honoring `XDG_CONFIG_HOME`), where OpenCode discovers it automatically.
+- Learned skills live in the standard global skills directory: `~/.config/opencode/skills/<id>/SKILL.md`, indexed by the hidden manifest `~/.config/opencode/skills/.adaptive-intelligence.json`. Every project reads and writes this same library. The manifest is hidden from skill discovery, and skills not selected for the current project are written with `opencode/autoinvoke: false` so OpenCode does not advertise them.
+- Skills learned by earlier versions under `~/.local/share/opencode/adaptive-intelligence/` and `~/.local/share/opencode/adaptive-memory/` are imported into the shared library at startup; those locations are read-only migration sources.
 - Version 1 and version 2 adaptive state is migrated to version 3 during startup.
 - Stores are bounded by the configured memory, edge, skill, decision, and session limits.
 - The plugin does not provide telemetry or upload its adaptive state to a separate service.
@@ -226,6 +272,8 @@ The plugin registers `intelligence_memory` with these actions:
 - `list` — list recent project memories
 - `forget` — remove a memory and its dangling relationships
 - `stats` — inspect bounded state and protection counters
+- `skills` — list the common library with each skill's tier, genre tags, and version, plus the skills active in this project
+- `sync` — re-read the common library immediately so newly learned skills are available
 
 Automatic planning, learning, recall, and skill registration do not require manual tool calls.
 
@@ -255,6 +303,7 @@ Core behavior and privacy tests are in `test/core.test.ts`.
 - `src/index.ts` — OpenCode V2 hooks, adaptive control loop, persistence, privacy enforcement, tools, and skill registration
 - `src/core.ts` — task assessment, memory graph, retrieval, token estimation, redaction, and context reduction
 - `test/core.test.ts` — deterministic behavior and privacy tests
+- `scripts/install.mjs` — installs the plugin into a standard OpenCode plugins directory
 - `opencode.example.jsonc` — example configuration
 - `RESEARCH.md` — architectural references, adopted patterns, and exclusions
 

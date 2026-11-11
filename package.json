@@ -8,6 +8,7 @@
   },
   "files": [
     "src",
+    "scripts",
     "index.ts",
     "README.md",
     "RESEARCH.md",
@@ -37,6 +38,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --import=tsx --test test/*.test.ts"
+    "test": "node --import=tsx --test test/*.test.ts",
+    "setup": "node scripts/install.mjs",
+    "uninstall": "node scripts/install.mjs --remove"
   }
 }

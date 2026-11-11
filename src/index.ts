@@ -1,4 +1,4 @@
-import { Plugin, Skill } from "@opencode/plugin"
+import { Plugin } from "@opencode/plugin"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
@@ -7,7 +7,9 @@ import {
   addOrMergeEdge,
   assessTask,
   compactOldToolOutputs,
+  computeSkillTier,
   decisionGuidance,
+  detectProjectTags,
   detectSensitiveInfo,
   emptyState,
   estimateTokens,
@@ -15,18 +17,25 @@ import {
   hybridSearchMemories,
   inferMemoryEdges,
   latestUserText,
+  librarySkillID,
+  mergeLibrarySkill,
+  normalizeStats,
   parseGeneratedJSON,
+  parseLibraryIndex,
+  parseSkillMarkdown,
   pseudonymizeValue,
   pruneGraph,
   readOptions,
   redactSecrets,
   sanitizeMessageText,
-  safeSkillID,
+  selectLibrarySkills,
   stableID,
+  textSimilarity,
   tokenize,
   type AdaptiveState,
   type DecisionRecord,
   type LearnedSkill,
+  type LibraryIndex,
   type Memory,
   type MemoryEdge,
   type MemoryKind,
@@ -35,6 +44,9 @@ import {
 } from "./core.js"
 
 const STATE_KEY = "adaptive/state-v1"
+// When a newly learned procedure is at least this similar to an existing library
+// skill, it is distilled into that skill instead of creating a near-duplicate.
+const SKILL_MERGE_SIMILARITY = 0.6
 const MEMORY_KINDS = new Set<MemoryKind>(["preference", "decision", "constraint", "fact", "failure", "solution"])
 const MEMORY_RELATIONS = new Set<MemoryRelation>([
   "supports", "contradicts", "caused-by", "solved-by", "supersedes", "depends-on", "applies-to", "related-to",
@@ -61,8 +73,9 @@ function extractionPrompt(autoSkills: boolean): string {
     '"relations":[{"from":0,"to":1,"type":"supports|contradicts|caused-by|solved-by|supersedes|depends-on|applies-to|related-to","confidence":0.0}],',
     '"skill":null OR {"id":"short-kebab-case","name":"Display name","description":"When this reusable procedure applies","content":"concise Markdown procedure with verification and failure handling","triggerTerms":["term"],"evidence":[0,1]}}',
     "Relation endpoints are zero-based indexes into memories. Add only relations directly supported by observed evidence; direction is from → type → to.",
-    "Create a skill only for a reusable, non-obvious procedure that was demonstrated successfully; otherwise use null.",
-    autoSkills ? "Skill creation is enabled." : "Always set skill to null because skill creation is disabled.",
+    "Create or refine a skill only for a reusable, non-obvious procedure that was demonstrated successfully; otherwise use null.",
+    "If a similar reusable procedure is already available, return the improved full procedure so it can be distilled into that skill.",
+    autoSkills ? "Skill creation and refinement are enabled." : "Always set skill to null because skill creation is disabled.",
     "Maximums: 5 memories, 8 relations, 1 skill, 120 words per memory, 600 words for skill content.",
   ].join("\n")
 }
@@ -74,14 +87,23 @@ export default Plugin.define({
     if (!options.enabled) return
 
     const projectID = String(ctx.location.project.id)
+    const projectDirectory = String(ctx.location.project.directory ?? ctx.location.directory ?? "")
+    // Standard OpenCode locations: skills live in the global skills directory,
+    // and this plugin's private index sits beside them as a hidden file that
+    // OpenCode's skill discovery skips.
+    const configRoot = process.env.XDG_CONFIG_HOME
+      ? path.join(process.env.XDG_CONFIG_HOME, "opencode")
+      : path.join(os.homedir(), ".config", "opencode")
+    const skillsDir = path.join(configRoot, "skills")
+    const libraryIndexFile = path.join(skillsDir, ".adaptive-intelligence.json")
+    // Read-only migration sources from earlier plugin versions.
     const dataRoot = path.join(os.homedir(), ".local", "share", "opencode")
-    const legacySkillRoot = path.join(dataRoot, "adaptive-memory", projectID, "skills")
-    const skillRoot = path.join(dataRoot, "adaptive-intelligence", projectID, "skills")
-    if (!fs.existsSync(skillRoot) && fs.existsSync(legacySkillRoot)) {
-      fs.mkdirSync(path.dirname(skillRoot), { recursive: true })
-      try { fs.renameSync(legacySkillRoot, skillRoot) } catch { /* migration is best-effort */ }
-    }
-    fs.mkdirSync(skillRoot, { recursive: true })
+    const legacySkillRoots = [
+      path.join(dataRoot, "adaptive-intelligence", "skills"),
+      path.join(dataRoot, "adaptive-intelligence", projectID, "skills"),
+      path.join(dataRoot, "adaptive-memory", projectID, "skills"),
+    ]
+    fs.mkdirSync(skillsDir, { recursive: true })
 
     const stored = await ctx.storage.get(STATE_KEY) as any
     let state: AdaptiveState
@@ -92,17 +114,18 @@ export default Plugin.define({
     } else {
       state = emptyState()
     }
-    state.stats = { ...emptyState().stats, ...(state.stats ?? {}) }
+    state.stats = normalizeStats(state.stats)
     if (options.sensitiveDataProtection) {
       const memoryCount = state.memories.length
-      const skillCount = state.skills.length
       state.memories = state.memories.filter((memory) => detectSensitiveInfo(memory.text).length === 0)
-      state.skills = state.skills.filter((skill) =>
-        detectSensitiveInfo([skill.name, skill.description, skill.content, ...skill.triggerTerms].join("\n")).length === 0,
-      )
-      state.stats.blockedMemoryWrites += (memoryCount - state.memories.length) + (skillCount - state.skills.length)
+      state.stats.blockedMemoryWrites += memoryCount - state.memories.length
     }
     pruneGraph(state, options.maxEdges)
+
+    // Coarse project "genre" tags decide which project-specific skills are
+    // relevant here. Detected tags are merged with explicitly configured ones.
+    const projectTags = [...new Set([...detectProjectTags(projectDirectory), ...options.projectTags])].sort().slice(0, 32)
+
     const injected = new Set<string>()
     const extracting = new Set<string>()
     const usedSkills = new Map<string, Set<string>>()
@@ -119,17 +142,35 @@ export default Plugin.define({
     // Persist schema hydration and startup scrubbing before any model request can run.
     await save()
 
-    const writeSkillFile = (skill: LearnedSkill): string => {
-      const directory = path.join(skillRoot, skill.id)
+    const tierOptions = {
+      commonMinProjects: options.commonSkillMinProjects,
+      commonMinUses: options.commonSkillMinUses,
+    }
+
+    const listDir = (directory: string): string[] => {
+      try { return fs.readdirSync(directory) } catch { return [] }
+    }
+
+    const writeSkillFile = (skill: LearnedSkill, visible: boolean): string => {
+      const directory = path.join(skillsDir, skill.id)
       fs.mkdirSync(directory, { recursive: true })
       const file = path.join(directory, "SKILL.md")
+      const projects = (skill.projectIDs ?? [skill.projectID]).filter(Boolean)
       const markdown = [
         "---",
         `name: ${skill.name.replace(/[\r\n]/g, " ")}`,
-        `description: ${skill.description.replace(/[\r\n]/g, " ")}`,
+        `description: ${(skill.description ?? "").replace(/[\r\n]/g, " ")}`,
         "metadata:",
         "  provenance: opencode-adaptive-intelligence",
+        // OpenCode advertises only skills whose autoinvoke is not false. Every
+        // library skill is written to the standard skills directory; skills
+        // selected for this project are advertised, the rest stay hidden.
+        `  opencode/autoinvoke: ${visible ? "true" : "false"}`,
+        `  tier: ${skill.tier ?? "project"}`,
         `  version: ${skill.version}`,
+        `  origin: ${skill.projectID}`,
+        `  projects: ${projects.join(",")}`,
+        `  tags: ${(skill.tags ?? []).join(",")}`,
         "---",
         "",
         skill.content,
@@ -139,32 +180,122 @@ export default Plugin.define({
       return file
     }
 
-    for (const skill of state.skills.filter((item) => item.projectID === projectID)) writeSkillFile(skill)
-    if (options.sensitiveDataProtection) {
-      const active = new Set(state.skills.filter((item) => item.projectID === projectID).map((item) => item.id))
+    const removeSkillFile = (id: string): void => {
       try {
-        for (const entry of fs.readdirSync(skillRoot)) {
-          if (!entry.startsWith("adaptive-") || active.has(entry)) continue
-          const directory = path.join(skillRoot, entry)
-          const file = path.join(directory, "SKILL.md")
-          try { fs.unlinkSync(file) } catch { /* absent or not plugin-owned */ }
-          try { fs.rmdirSync(directory) } catch { /* keep directories with other content */ }
-        }
-      } catch { /* cleanup is best-effort */ }
+        fs.unlinkSync(path.join(skillsDir, id, "SKILL.md"))
+        fs.rmdirSync(path.join(skillsDir, id))
+      } catch { /* absent or not plugin-owned */ }
     }
 
-    await ctx.skill.transform((editor) => {
-      for (const skill of state.skills.filter((item) => item.projectID === projectID)) {
-        editor.add({
-          id: Skill.ID.make(skill.id),
-          name: Skill.Name.make(skill.name),
-          description: skill.description,
-          path: Skill.Info.fields.path.make(writeSkillFile(skill)),
-          content: skill.content,
-          autoinvoke: true,
-        })
+    // Load the common library. The manifest is authoritative; a missing manifest
+    // is rebuilt from SKILL.md files, and skills still held in plugin state by
+    // older versions are imported.
+    const loadLibrary = (): LearnedSkill[] => {
+      const skills: LearnedSkill[] = []
+      const seen = new Set<string>()
+      const add = (skill: LearnedSkill): void => {
+        if (!skill.id || seen.has(skill.id)) return
+        if (options.sensitiveDataProtection && detectSensitiveInfo([skill.name, skill.description, skill.content, ...(skill.triggerTerms ?? [])].join("\n")).length) {
+          state.stats.blockedMemoryWrites++
+          return
+        }
+        seen.add(skill.id)
+        skills.push(skill)
       }
-    })
+      let manifestRead = false
+      try {
+        const parsed = parseLibraryIndex(JSON.parse(fs.readFileSync(libraryIndexFile, "utf8")))
+        manifestRead = true
+        for (const skill of parsed.skills) add(skill)
+      } catch { /* manifest missing or unreadable */ }
+      if (!manifestRead) {
+        const scan = (directory: string): void => {
+          for (const entry of listDir(directory)) {
+            // The shared skills directory also holds user-authored skills.
+            // Only plugin-owned entries (prefixed `adaptive-`) are imported.
+            if (!entry.startsWith("adaptive-") || seen.has(entry)) continue
+            let parsed
+            try { parsed = parseSkillMarkdown(fs.readFileSync(path.join(directory, entry, "SKILL.md"), "utf8")) } catch { continue }
+            if (!parsed) continue
+            const now = new Date().toISOString()
+            const origin = parsed.metadata.origin ?? ""
+            add({
+              id: entry, name: parsed.name, description: parsed.description, content: parsed.content,
+              triggerTerms: tokenize(parsed.description).slice(0, 12), projectID: origin,
+              version: Math.max(1, Number(parsed.metadata.version) || 1), uses: 0, successes: 0, failures: 0,
+              createdAt: now, updatedAt: now, tier: parsed.metadata.tier === "common" ? "common" : "project",
+              tags: (parsed.metadata.tags ?? "").split(",").map((tag) => tag.trim().toLowerCase()).filter(Boolean),
+              projectIDs: origin ? [origin] : [],
+            })
+          }
+        }
+        scan(skillsDir)
+        for (const legacy of legacySkillRoots) scan(legacy)
+      }
+      for (const skill of state.skills) add({ ...skill })
+      return skills
+    }
+
+    let library = loadLibrary()
+    // Skills are owned by the shared library from now on, not by this project.
+    state.skills = []
+
+    const writeLibrary = (): void => {
+      try {
+        fs.mkdirSync(skillsDir, { recursive: true })
+        const visible = new Set(selectedSkills.map((skill) => skill.id))
+        for (const skill of library) writeSkillFile(skill, visible.has(skill.id))
+        const index: LibraryIndex = { version: 1, updatedAt: new Date().toISOString(), skills: library }
+        const temp = `${libraryIndexFile}.${process.pid}.tmp`
+        fs.writeFileSync(temp, JSON.stringify(index), "utf8")
+        fs.renameSync(temp, libraryIndexFile)
+      } catch { /* library persistence is best-effort */ }
+    }
+
+    // Library skills selected for this project. OpenCode advertises the matching
+    // skill files; every other library skill is written hidden.
+    let selectedSkills: LearnedSkill[] = []
+
+    const refreshSelection = async (): Promise<void> => {
+      if (options.sharedSkills) {
+        selectedSkills = selectLibrarySkills(library, projectID, projectTags, {
+          minSimilarity: options.skillSimilarityThreshold,
+          maxSkills: options.maxSkills,
+          ...tierOptions,
+        }).map((candidate) => candidate.skill)
+      } else {
+        selectedSkills = library.filter((skill) => (skill.projectIDs ?? [skill.projectID]).includes(projectID))
+      }
+      for (const skill of selectedSkills) {
+        if (!skill.tier) skill.tier = computeSkillTier(skill, tierOptions)
+      }
+      state.stats.librarySkills = library.length
+      state.stats.libraryAdopted = selectedSkills.length
+      writeLibrary()
+      await save()
+      await ctx.skill.reload()
+    }
+
+    const pruneLibrary = (): void => {
+      const limit = Math.max(120, options.maxSkills * 6)
+      if (library.length <= limit) return
+      library.sort((a, b) => (b.uses + b.successes - b.failures) - (a.uses + a.successes - a.failures))
+      for (const removed of library.slice(limit)) removeSkillFile(removed.id)
+      library = library.slice(0, limit)
+    }
+
+    const findLibraryMatch = (id: string, name: string, description: string, triggerTerms: string[]): LearnedSkill | undefined => {
+      const byId = library.find((skill) => skill.id === id)
+      if (byId) return byId
+      const candidate = [name, description, ...triggerTerms].join(" ")
+      return library.find((skill) =>
+        textSimilarity(candidate, [skill.name, skill.description, ...(skill.triggerTerms ?? [])].join(" ")) >= SKILL_MERGE_SIMILARITY,
+      )
+    }
+
+    // Select this project's initial skill set and publish the library. This also
+    // migrates any skills learned by earlier versions of the plugin.
+    await refreshSelection()
 
     const providerIsLocal = (providerID: string): boolean => {
       const normalized = providerID.toLowerCase()
@@ -400,36 +531,32 @@ export default Plugin.define({
           const description = stringValue(raw.description, 500)
           const name = stringValue(raw.name, 80)
           if (content && description && name) {
-            const id = safeSkillID(stringValue(raw.id, 64) || name, projectID)
+            const id = librarySkillID(stringValue(raw.id, 64) || name)
             const triggerTerms = Array.isArray(raw.triggerTerms)
               ? raw.triggerTerms.map((term) => stringValue(term, 40)).filter(Boolean).slice(0, 12)
               : tokenize(description).slice(0, 12)
             const evidenceMemoryIDs = Array.isArray(raw.evidence)
               ? raw.evidence.map((index) => memoryIDsByIndex[Number(index)]).filter((id): id is string => !!id).slice(0, 8)
               : freshIDs.slice(0, 8)
-            const existing = state.skills.find((skill) => skill.id === id)
+            const existing = findLibraryMatch(id, name, description, triggerTerms)
             if (existing) {
-              existing.content = content
-              existing.description = description
-              existing.triggerTerms = triggerTerms
-              existing.version++
-              existing.evidenceMemoryIDs = [...new Set([...(existing.evidenceMemoryIDs ?? []), ...evidenceMemoryIDs])].slice(-20)
-              existing.updatedAt = now
-              writeSkillFile(existing)
+              // An equivalent procedure is already in the library; distill the new
+              // observation into it instead of creating a near-duplicate skill.
+              mergeLibrarySkill(existing, {
+                name, description, content, triggerTerms, tags: [...projectTags], projectID, evidenceMemoryIDs, now,
+              })
+              existing.tier = computeSkillTier(existing, tierOptions)
+              state.stats.libraryRefinements++
             } else {
               const skill: LearnedSkill = {
                 id, name, description, content, triggerTerms, projectID, version: 1,
                 uses: 0, successes: 0, failures: 0, createdAt: now, updatedAt: now,
-                evidenceMemoryIDs,
+                evidenceMemoryIDs, tags: [...projectTags], tier: "project", projectIDs: [projectID],
               }
-              state.skills.push(skill)
-              if (state.skills.length > options.maxSkills) {
-                state.skills.sort((a, b) => (b.successes - b.failures + b.uses * 0.1) - (a.successes - a.failures + a.uses * 0.1))
-                state.skills.length = options.maxSkills
-              }
-              writeSkillFile(skill)
+              library.push(skill)
             }
-            await ctx.skill.reload()
+            pruneLibrary()
+            await refreshSelection()
           }
         }
 
@@ -469,13 +596,16 @@ export default Plugin.define({
       if (event.tool !== "skill") return
       const input = asRecord(event.input)
       const id = stringValue(input.id ?? input.name, 100)
-      const skill = state.skills.find((candidate) => candidate.id === id)
+      const skill = library.find((candidate) => candidate.id === id)
       if (!skill) return
       skill.uses++
       skill.updatedAt = new Date().toISOString()
+      skill.projectIDs = [...new Set([...(skill.projectIDs ?? [skill.projectID]), projectID].filter(Boolean))]
+      skill.tier = computeSkillTier(skill, tierOptions)
       const session = usedSkills.get(event.sessionID) ?? new Set<string>()
       session.add(id)
       usedSkills.set(event.sessionID, session)
+      writeLibrary()
       await save()
     })
 
@@ -513,11 +643,12 @@ export default Plugin.define({
           })
         })
         for (const id of ids) {
-          const skill = state.skills.find((candidate) => candidate.id === id)
+          const skill = library.find((candidate) => candidate.id === id)
           if (!skill) continue
           if (failed) skill.failures++
           else skill.successes++
           skill.updatedAt = new Date().toISOString()
+          skill.tier = computeSkillTier(skill, tierOptions)
           const evidence = new Set(skill.evidenceMemoryIDs ?? [])
           for (const memory of state.memories) {
             if (!evidence.has(memory.id)) continue
@@ -533,6 +664,7 @@ export default Plugin.define({
           }
         }
         usedSkills.delete(event.sessionID)
+        writeLibrary()
         await save()
       } catch { /* telemetry must not affect the session */ }
     })
@@ -579,7 +711,7 @@ export default Plugin.define({
         input: {
           type: "object",
           properties: {
-            action: { type: "string", enum: ["search", "add", "list", "forget", "stats"] },
+            action: { type: "string", enum: ["search", "add", "list", "forget", "stats", "skills", "sync"] },
             query: { type: "string" },
             text: { type: "string" },
             kind: { type: "string", enum: [...MEMORY_KINDS] },
@@ -638,11 +770,39 @@ export default Plugin.define({
               activeMemories: state.memories.filter((memory) => !memory.validUntil).length,
               graphEdges: state.edges.length,
               decisions: state.decisions.length,
-              skills: state.skills.length,
+              activeSkills: selectedSkills.length,
+              projectTags,
               sessions: Object.keys(state.sessions).length,
               ...state.stats,
               options,
             }, null, 2) }
+          }
+          if (action === "skills") {
+            return { content: JSON.stringify({
+              projectTags,
+              active: selectedSkills.map((skill) => skill.id),
+              library: library.map((skill) => ({
+                id: skill.id,
+                name: skill.name,
+                description: skill.description,
+                tier: skill.tier ?? "project",
+                tags: skill.tags ?? [],
+                version: skill.version,
+                uses: skill.uses,
+                successes: skill.successes,
+                failures: skill.failures,
+                projects: (skill.projectIDs ?? [skill.projectID]).filter(Boolean),
+                origin: skill.projectID,
+              })),
+            }, null, 2) }
+          }
+          if (action === "sync") {
+            // Re-read the common folder so skills learned by other projects since
+            // this session started become available here.
+            library = loadLibrary()
+            state.skills = []
+            await refreshSelection()
+            return { content: `Library skills: ${library.length}; active here: ${selectedSkills.length} (project tags: ${projectTags.join(", ") || "none"}).` }
           }
           const limit = Math.max(1, Math.min(50, Number(input.limit) || 10))
           return { content: JSON.stringify(state.memories.filter((memory) => memory.projectID === projectID).slice(-limit), null, 2) }

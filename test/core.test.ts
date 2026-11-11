@@ -1,21 +1,35 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import * as fs from "node:fs"
+import * as os from "node:os"
+import * as path from "node:path"
 import {
   addOrMergeEdge,
   addOrMergeMemory,
   assessTask,
   compactOldToolOutputs,
   decisionGuidance,
+  detectProjectTags,
   emptyState,
   hybridSearchMemories,
+  computeSkillTier,
   inferMemoryEdges,
+  librarySkillID,
+  mergeLibrarySkill,
+  normalizeStats,
   parseGeneratedJSON,
+  parseLibraryIndex,
+  parseSkillMarkdown,
+  projectSimilarity,
   pseudonymizeSensitive,
   pseudonymizeValue,
   redactSecrets,
   sanitizeMessageText,
   searchMemories,
+  selectLibrarySkills,
+  textSimilarity,
   tokenize,
+  type LearnedSkill,
   type Memory,
 } from "../src/core.js"
 
@@ -176,4 +190,157 @@ test("outbound tool payloads are deeply pseudonymized without mutating input", (
   assert.ok(scan.replacements > 0)
   assert.match(input.headers.authorization, /abcdefghijklmnopqrstuvwxyz/)
   assert.doesNotMatch(JSON.stringify(scan.value), /abcdefghijklmnopqrstuvwxyz/)
+})
+
+function librarySkill(id: string, overrides: Partial<LearnedSkill> = {}): LearnedSkill {
+  const now = new Date().toISOString()
+  return {
+    id, name: id, description: `procedure ${id}`, content: `steps for ${id}`, triggerTerms: [],
+    projectID: "p1", version: 1, uses: 0, successes: 0, failures: 0, createdAt: now, updatedAt: now,
+    tags: [], tier: "project", projectIDs: ["p1"], ...overrides,
+  }
+}
+
+const TIER_OPTIONS = { commonMinProjects: 2, commonMinUses: 3 }
+
+test("project tags are detected from marker files and manifests", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "adaptive-tags-"))
+  fs.writeFileSync(path.join(directory, "package.json"), JSON.stringify({
+    dependencies: { react: "^18", vite: "^5" }, devDependencies: { typescript: "^5" },
+  }))
+  fs.writeFileSync(path.join(directory, "tsconfig.json"), "{}")
+  const tags = detectProjectTags(directory)
+  assert.ok(tags.includes("node"))
+  assert.ok(tags.includes("javascript"))
+  assert.ok(tags.includes("typescript"))
+  assert.ok(tags.includes("react"))
+  assert.ok(tags.includes("vite"))
+  assert.equal(detectProjectTags(path.join(directory, "does-not-exist")).length, 0)
+})
+
+test("project similarity reflects shared genre tags", () => {
+  assert.equal(projectSimilarity(["node", "react", "vite"], ["node", "react", "vite"]), 1)
+  assert.equal(projectSimilarity(["node", "react"], ["python", "django"]), 0)
+  assert.ok(projectSimilarity(["node", "react", "vite"], ["node", "react", "webpack"]) > 0)
+  assert.equal(projectSimilarity([], ["node"]), 0)
+})
+
+test("text similarity reflects overlapping procedure text", () => {
+  assert.equal(textSimilarity("run the test suite", "run the test suite"), 1)
+  assert.equal(textSimilarity("run the test suite", "deploy the database"), 0)
+  assert.ok(textSimilarity("run the vitest suite", "run the vitest unit suite") > 0.3)
+  assert.equal(textSimilarity("", "anything"), 0)
+})
+
+test("library skill identifiers are stable and project-independent", () => {
+  assert.equal(librarySkillID("Run Vitest!"), "adaptive-run-vitest")
+  assert.equal(librarySkillID("Run Vitest!"), librarySkillID("run   vitest"))
+  assert.equal(librarySkillID(""), "adaptive-learned-workflow")
+})
+
+test("skill tiers promote broadly used reliable skills to common", () => {
+  assert.equal(computeSkillTier(librarySkill("a", { projectIDs: ["p1"] }), TIER_OPTIONS), "project")
+  assert.equal(computeSkillTier(librarySkill("b", { projectIDs: ["p1", "p2"], successes: 1 }), TIER_OPTIONS), "common")
+  assert.equal(computeSkillTier(librarySkill("c", { uses: 5, successes: 2, failures: 0 }), TIER_OPTIONS), "common")
+  assert.equal(computeSkillTier(librarySkill("d", { projectIDs: ["p1", "p2"], successes: 1, failures: 3 }), TIER_OPTIONS), "project")
+})
+
+test("merging a richer procedure distills it into the existing skill", () => {
+  const existing = librarySkill("a", { content: "short", version: 2, tags: ["node"], projectIDs: ["p1"] })
+  const result = mergeLibrarySkill(existing, {
+    name: "A", description: "a longer description of the procedure",
+    content: "a much longer and more complete procedure with verification steps",
+    triggerTerms: ["test"], tags: ["vite"], projectID: "p2", evidenceMemoryIDs: ["m1"], now: "2026-01-01T00:00:00.000Z",
+  })
+  assert.equal(result.refined, true)
+  assert.equal(existing.version, 3)
+  assert.match(existing.content, /more complete procedure/)
+  assert.deepEqual([...existing.tags ?? []].sort(), ["node", "vite"])
+  assert.deepEqual([...existing.projectIDs ?? []].sort(), ["p1", "p2"])
+  assert.equal(existing.history?.length, 1)
+})
+
+test("library selection surfaces common skills and matching project skills", () => {
+  const common = librarySkill("common", { tier: "common", projectIDs: ["p1", "p2"] })
+  const similar = librarySkill("similar", { tier: "project", tags: ["node", "react", "vite"], projectIDs: ["p9"] })
+  const unrelated = librarySkill("unrelated", { tier: "project", tags: ["python", "django"], projectIDs: ["p8"] })
+  const selected = selectLibrarySkills(
+    [common, similar, unrelated], "p1", ["node", "react", "vite"],
+    { minSimilarity: 0.34, maxSkills: 10, ...TIER_OPTIONS },
+  )
+  assert.deepEqual(selected.map((entry) => entry.skill.id).sort(), ["common", "similar"])
+})
+
+test("library selection respects the skill cap", () => {
+  const skills = [
+    librarySkill("a", { tier: "common", projectIDs: ["p1"] }),
+    librarySkill("b", { tier: "common", projectIDs: ["p1"] }),
+    librarySkill("c", { tier: "common", projectIDs: ["p1"] }),
+  ]
+  const selected = selectLibrarySkills(skills, "p1", [], { minSimilarity: 0.34, maxSkills: 2, ...TIER_OPTIONS })
+  assert.equal(selected.length, 2)
+})
+
+test("untrusted library manifests are validated and normalized", () => {
+  const empty = parseLibraryIndex(null)
+  assert.equal(empty.skills.length, 0)
+  const parsed = parseLibraryIndex({
+    version: 1,
+    skills: [
+      { id: "s", name: "S", content: "do it", tags: ["Node"], projectIDs: ["p9"], version: 2, uses: 4, successes: 3, failures: 0, tier: "common" },
+      { id: "", name: "missing id", content: "x" },
+    ],
+  })
+  assert.equal(parsed.skills.length, 1)
+  assert.equal(parsed.skills[0]?.version, 2)
+  assert.equal(parsed.skills[0]?.uses, 4)
+  assert.equal(parsed.skills[0]?.tier, "common")
+  assert.deepEqual(parsed.skills[0]?.tags, ["node"])
+  assert.ok(parsed.skills[0]?.projectIDs?.includes("p9"))
+})
+
+test("persisted stats are normalized and drop stale keys", () => {
+  const stats = normalizeStats({
+    extractions: 5,
+    librarySkills: 2,
+    sharedSkillsActive: 7,
+    sharedSkillUses: 3,
+    sharedRegistriesRead: 1,
+    nonsense: "x",
+  })
+  assert.equal(stats.extractions, 5)
+  assert.equal(stats.librarySkills, 2)
+  assert.equal(stats.libraryRefinements, 0)
+  assert.ok(!("sharedSkillsActive" in stats))
+  assert.ok(!("sharedSkillUses" in stats))
+  assert.ok(!("sharedRegistriesRead" in stats))
+  assert.ok(!("nonsense" in stats))
+  assert.equal(normalizeStats(null).extractions, 0)
+})
+
+test("skill markdown files round-trip through the manifest fallback parser", () => {
+  const markdown = [
+    "---",
+    "name: Run Vitest",
+    "description: How to run the test suite",
+    "metadata:",
+    "  provenance: opencode-adaptive-intelligence",
+    "  tier: common",
+    "  version: 3",
+    "  origin: p1",
+    "  projects: p1,p2",
+    "  tags: node,vite",
+    "---",
+    "",
+    "1. Install dependencies.",
+    "2. Run vitest.",
+    "",
+  ].join("\n")
+  const parsed = parseSkillMarkdown(markdown)
+  assert.equal(parsed?.name, "Run Vitest")
+  assert.equal(parsed?.metadata.tier, "common")
+  assert.equal(parsed?.metadata.version, "3")
+  assert.equal(parsed?.metadata.origin, "p1")
+  assert.match(parsed?.content ?? "", /Run vitest/)
+  assert.equal(parseSkillMarkdown("no frontmatter here"), null)
 })

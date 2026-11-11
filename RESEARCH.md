@@ -4,7 +4,7 @@ Research checked on 2026-11-11. OpenCode V2 documentation is the API source of t
 
 ## Systems reviewed
 
-- [OpenCode V2 plugin API](https://opencode.ai/docs/build/plugins/) — `Plugin.define`, session hooks, plugin storage, tools, and native skill transforms.
+- [OpenCode V2 plugin API](https://opencode.ai/docs/build/plugins/) — `Plugin.define`, session hooks, plugin storage, tools, and the native skill discovery/registry API.
 - [OpenCode V2 compaction](https://opencode.ai/docs/compaction/) — native automatic compaction and recent-context retention; this plugin complements rather than replaces it.
 - [OpenCode Mem](https://github.com/tickernelz/opencode-mem) — local vector recall, idle capture, profiles, deduplication, and V2 skill registration.
 - [OpenCode Deep Memory](https://github.com/BD7PIL/opencode-deep-memory) — BM25-style local retrieval, cache-stable injection, tool-output caps, consolidation, and recoverable compression.
@@ -30,13 +30,13 @@ Projects without a clear open-source license were not used as implementation sou
 
 ## Adopted choices
 
-1. **Local first and no external service.** OpenCode plugin storage holds bounded JSON state; generated skill files are inspectable under `~/.local/share/opencode/adaptive-intelligence/`.
+1. **Local first and no external service.** OpenCode plugin storage holds bounded JSON state; the plugin installs into the standard plugins directory (`~/.config/opencode/plugins/`) and generated skill files are inspectable under the standard global skills directory (`~/.config/opencode/skills/`).
 2. **One bounded extraction call, only after meaningful growth.** This avoids an LLM call after every turn and reuses the current session/model.
 3. **Dependency-free hybrid retrieval at this scale.** Lexical relevance produces precise seeds; a bounded local adjacency graph expands one or two hops; confidence, outcomes, recency, and maximal-marginal-relevance-style diversity rerank the final set. At roughly 200 memories, a graph database and embedding service add more operational cost than value.
 4. **Temporal facts rather than destructive replacement.** A high-confidence `supersedes` edge must be observed at least twice before it closes the old memory's validity window. History and provenance remain stored; inactive memories are excluded from normal recall.
 5. **Typed, evidence-scoped relationships.** `supports`, `contradicts`, `caused-by`, `solved-by`, `supersedes`, `depends-on`, `applies-to`, and `related-to` edges are bounded and confidence-gated. Deterministic high-precision links supplement model-extracted links.
 6. **Pull only a few diverse memories.** The plugin never injects full session archives. Graph traversal has a strict depth, fan-out, result-count, and character budget.
-7. **Evidence-linked skill mutation.** Skills live in plugin-owned storage, retain supporting memory IDs, register through `ctx.skill.transform`, and feed coarse success/failure outcomes back into evidence and edge confidence signals. The plugin never edits project source files.
+7. **Evidence-linked skill mutation.** Skills live in one shared library in the standard global skills directory (`~/.config/opencode/skills/`) that every project shares, are advertised to the model only when selected for the project (`metadata.opencode/autoinvoke: true`) and otherwise remain registered but hidden, retain supporting memory IDs, and feed coarse success/failure outcomes back into evidence and edge confidence signals. New procedures are distilled into existing skills instead of duplicated, and broadly useful skills are promoted to a common tier. The plugin never edits project source files.
 8. **Loss-minimizing token control.** Only old, oversized tool results are shortened in outgoing model requests. Persisted OpenCode history remains unchanged and remains the recovery source.
 9. **Secret redaction and bounded stores.** Captures are sanitized, deduplicated, length-limited, and evicted by utility; dangling graph edges are pruned.
 10. **Privacy at request and persistence boundaries.** Prompt admission marks sensitive sessions, remote model requests receive synthetic placeholders, local-provider IDs are explicit, and memory/skill writes fail closed.
