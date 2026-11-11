@@ -255,7 +255,6 @@ Example configuration:
 - Structured adaptive state is stored through OpenCode's plugin-scoped storage.
 - The plugin is installed into the standard plugins directory, `~/.config/opencode/plugins/opencode-adaptive-intelligence` (honoring `XDG_CONFIG_HOME`), where OpenCode discovers it automatically.
 - Learned skills live in the standard global skills directory: `~/.config/opencode/skills/<id>/SKILL.md`, indexed by the hidden manifest `~/.config/opencode/skills/.adaptive-intelligence.json`. Every project reads and writes this same library. The manifest is hidden from skill discovery, and skills not selected for the current project are written with `opencode/autoinvoke: false` so OpenCode does not advertise them.
-- Skills learned by earlier versions under `~/.local/share/opencode/adaptive-intelligence/` and `~/.local/share/opencode/adaptive-memory/` are imported into the shared library at startup; those locations are read-only migration sources.
 - Version 1 and version 2 adaptive state is migrated to version 3 during startup.
 - Stores are bounded by the configured memory, edge, skill, decision, and session limits.
 - The plugin does not provide telemetry or upload its adaptive state to a separate service.

@@ -96,13 +96,6 @@ export default Plugin.define({
       : path.join(os.homedir(), ".config", "opencode")
     const skillsDir = path.join(configRoot, "skills")
     const libraryIndexFile = path.join(skillsDir, ".adaptive-intelligence.json")
-    // Read-only migration sources from earlier plugin versions.
-    const dataRoot = path.join(os.homedir(), ".local", "share", "opencode")
-    const legacySkillRoots = [
-      path.join(dataRoot, "adaptive-intelligence", "skills"),
-      path.join(dataRoot, "adaptive-intelligence", projectID, "skills"),
-      path.join(dataRoot, "adaptive-memory", projectID, "skills"),
-    ]
     fs.mkdirSync(skillsDir, { recursive: true })
 
     const stored = await ctx.storage.get(STATE_KEY) as any
@@ -230,7 +223,6 @@ export default Plugin.define({
           }
         }
         scan(skillsDir)
-        for (const legacy of legacySkillRoots) scan(legacy)
       }
       for (const skill of state.skills) add({ ...skill })
       return skills
