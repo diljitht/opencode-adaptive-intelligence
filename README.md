@@ -36,7 +36,7 @@ Adaptive guidance never overrides user instructions, project instructions, permi
 
 The plugin keeps bounded decision records containing task fingerprints, assessment scores, recommended and observed delegation, and outcomes. Raw task text is not stored in decision history.
 
-Outcomes are classified as:
+Outcomes are classified within the current user-task boundary as:
 
 - `success` when verification evidence is present
 - `failure` when explicit failure evidence is present
@@ -89,7 +89,7 @@ Skills are learned by analyzing the problem at hand, then distilled and refined 
 
 The plugin estimates request size against the selected model's context limit and reserves configurable space for integration, verification, and recovery.
 
-For outgoing model requests, old oversized tool results may be shortened while recent results remain intact. The original OpenCode session history is not modified. OpenCode's native compaction remains the primary context-window safeguard.
+For outgoing model requests approaching the configured context reserve, old oversized tool results may be shortened while recent results remain intact. Requests with comfortable context headroom are left unchanged. The original OpenCode session history is not modified. OpenCode's native compaction remains the primary context-window safeguard.
 
 ### Sensitive-data protection
 
@@ -199,7 +199,7 @@ All options are optional.
 | `maxTotalMemories` | `2000` | Safety cap across a state store or shared-preference store. |
 | `maxEdges` | `800` | Maximum stored memory relationships. |
 | `maxSkills` | `30` | Maximum library skills registered in one project at once. |
-| `recallCount` | `3` | Maximum memories recalled per session. |
+| `recallCount` | `3` | Maximum memories recalled per user task. |
 | `recallCharacters` | `1600` | Maximum characters in the recalled evidence block. |
 | `minimumRecallScore` | `0.16` | Minimum lexical seed score for recall. |
 | `graphDepth` | `2` | Maximum graph traversal depth; values are capped at two. |
@@ -274,12 +274,21 @@ Automatic learning uses the active session model. If that model is remote, sanit
 The plugin registers `intelligence_memory` with these actions:
 
 - `search` — run hybrid lexical and graph retrieval
+- `get` — inspect one memory with its provenance and relationships
 - `add` — store a validated memory explicitly
+- `confirm` — explicitly confirm a memory and strengthen its evidence
+- `correct` — add a verified replacement and supersede an older memory
 - `list` — list recent project memories
 - `forget` — remove a memory and its dangling relationships
+- `clear-project` — clear this project's adaptive state
 - `stats` — inspect bounded state and protection counters
+- `doctor` — diagnose state, graph, skill, persistence, and retry health
+- `export` — export this project's memories, graph, and decision history
 - `skills` — list the common library with each skill's tier, genre tags, and version, plus the skills active in this project
+- `delete-skill` — remove a plugin-owned learned skill
 - `sync` — re-read the common library immediately so newly learned skills are available
+
+Memory and skill mutations request permission through OpenCode before changing state.
 
 Automatic planning, learning, recall, and skill registration do not require manual tool calls.
 
@@ -313,10 +322,10 @@ npm run evaluate -- results.jsonl
 Each JSONL row has the shape:
 
 ```json
-{"task":"task-id","variant":"control","completed":1,"verified":1,"tokens":12000,"incorrectRecalls":0,"regression":0}
+{"task":"task-id","variant":"control","completed":1,"verified":1,"tokens":12000,"learningTokens":0,"incorrectRecalls":0,"regression":0}
 ```
 
-Provide one `control` and one `plugin` row per task. The report compares completion, verification, token usage, incorrect recalls, and regressions. This avoids treating additional context or model calls as evidence of improvement.
+Provide one `control` and one `plugin` row per task. The report validates rows and compares paired completion, verification, average/median/p95 task tokens, learning tokens, incorrect recalls, and regressions. This avoids treating additional context or model calls as evidence of improvement.
 
 Core behavior and privacy tests are in `test/core.test.ts`.
 

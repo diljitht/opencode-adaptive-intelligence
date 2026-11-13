@@ -144,6 +144,8 @@ export interface DecisionRecord {
   id: string
   sessionID: string
   taskFingerprint: string
+  /** Message index where this task's user turn begins. */
+  taskStartMessageIndex?: number
   assessment: TaskAssessment
   actualSubagents: number
   outcome: DecisionOutcome
@@ -316,6 +318,132 @@ export function normalizeStats(raw: unknown): AdaptiveState["stats"] {
   return stats
 }
 
+/** Validate persisted state before it is used by hooks or filesystem writers. */
+export function normalizeAdaptiveState(raw: unknown): AdaptiveState {
+  const state = emptyState()
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return state
+  const record = raw as Record<string, unknown>
+  const validDate = (value: unknown, fallback: string): string =>
+    typeof value === "string" && Number.isFinite(Date.parse(value)) ? value : fallback
+  const memoryKinds = new Set<MemoryKind>(["preference", "decision", "constraint", "fact", "failure", "solution"])
+  const relations = new Set<MemoryRelation>([
+    "supports", "contradicts", "caused-by", "solved-by", "supersedes", "depends-on", "applies-to", "related-to",
+  ])
+  const now = new Date().toISOString()
+
+  if (Array.isArray(record.memories)) {
+    for (const rawMemory of record.memories.slice(0, 20_000)) {
+      if (!rawMemory || typeof rawMemory !== "object" || Array.isArray(rawMemory)) continue
+      const item = rawMemory as Record<string, unknown>
+      const id = typeof item.id === "string" ? item.id.slice(0, 100) : ""
+      const text = typeof item.text === "string" ? item.text.slice(0, 1_000) : ""
+      const kind = item.kind as MemoryKind
+      const projectID = typeof item.projectID === "string" ? item.projectID.slice(0, 200) : ""
+      if (!id || !text || !projectID || !memoryKinds.has(kind)) continue
+      const createdAt = validDate(item.createdAt, now)
+      state.memories.push({
+        id, text, kind, projectID,
+        keywords: Array.isArray(item.keywords)
+          ? item.keywords.filter((value): value is string => typeof value === "string").slice(0, 80)
+          : tokenize(text),
+        confidence: clamp(item.confidence, 0.5, 0, 1),
+        uses: Math.floor(clamp(item.uses, 0, 0, 1_000_000)),
+        createdAt,
+        contentUpdatedAt: item.contentUpdatedAt ? validDate(item.contentUpdatedAt, createdAt) : undefined,
+        lastAccessedAt: item.lastAccessedAt ? validDate(item.lastAccessedAt, createdAt) : undefined,
+        lastConfirmedAt: item.lastConfirmedAt ? validDate(item.lastConfirmedAt, createdAt) : undefined,
+        updatedAt: validDate(item.updatedAt, createdAt),
+        sourceSession: typeof item.sourceSession === "string" ? item.sourceSession.slice(0, 200) : undefined,
+        sourceRefs: stringList(item.sourceRefs, 20),
+        validFrom: item.validFrom ? validDate(item.validFrom, createdAt) : undefined,
+        validUntil: item.validUntil ? validDate(item.validUntil, createdAt) : undefined,
+        supersededBy: typeof item.supersededBy === "string" ? item.supersededBy.slice(0, 100) : undefined,
+      })
+    }
+  }
+
+  const memoryIDs = new Set(state.memories.map((memory) => memory.id))
+  if (Array.isArray(record.edges)) {
+    for (const rawEdge of record.edges.slice(0, 100_000)) {
+      if (!rawEdge || typeof rawEdge !== "object" || Array.isArray(rawEdge)) continue
+      const item = rawEdge as Record<string, unknown>
+      const id = typeof item.id === "string" ? item.id.slice(0, 100) : ""
+      const from = typeof item.from === "string" ? item.from.slice(0, 100) : ""
+      const to = typeof item.to === "string" ? item.to.slice(0, 100) : ""
+      const relation = item.relation as MemoryRelation
+      if (!id || from === to || !memoryIDs.has(from) || !memoryIDs.has(to) || !relations.has(relation)) continue
+      const createdAt = validDate(item.createdAt, now)
+      state.edges.push({
+        id, from, to, relation,
+        confidence: clamp(item.confidence, 0.5, 0, 1),
+        confirmations: Math.floor(clamp(item.confirmations, 0, 0, 1_000_000)),
+        contradictions: Math.floor(clamp(item.contradictions, 0, 0, 1_000_000)),
+        active: item.active !== false,
+        projectID: typeof item.projectID === "string" ? item.projectID.slice(0, 200) : "",
+        sourceSession: typeof item.sourceSession === "string" ? item.sourceSession.slice(0, 200) : undefined,
+        confirmationRefs: stringList(item.confirmationRefs, 20),
+        createdAt,
+        updatedAt: validDate(item.updatedAt, createdAt),
+      })
+    }
+  }
+
+  state.skills = parseLibraryIndex({ version: 1, skills: record.skills }).skills
+  if (Array.isArray(record.decisions)) {
+    for (const rawDecision of record.decisions.slice(-2_000)) {
+      if (!rawDecision || typeof rawDecision !== "object" || Array.isArray(rawDecision)) continue
+      const item = rawDecision as Record<string, unknown>
+      const assessment = item.assessment && typeof item.assessment === "object"
+        ? item.assessment as Record<string, unknown>
+        : {}
+      const id = typeof item.id === "string" ? item.id.slice(0, 100) : ""
+      const sessionID = typeof item.sessionID === "string" ? item.sessionID.slice(0, 200) : ""
+      if (!id || !sessionID) continue
+      const createdAt = validDate(item.createdAt, now)
+      const strategy: TaskStrategy = assessment.strategy === "risk-controlled" || assessment.strategy === "inspect-plan-execute"
+        ? assessment.strategy
+        : "direct"
+      const outcome: DecisionOutcome = item.outcome === "success" || item.outcome === "failure" ||
+        item.outcome === "inconclusive" ? item.outcome : "pending"
+      state.decisions.push({
+        id, sessionID,
+        taskFingerprint: typeof item.taskFingerprint === "string" ? item.taskFingerprint.slice(0, 100) : id,
+        taskStartMessageIndex: Math.floor(clamp(item.taskStartMessageIndex, 0, 0, 1_000_000)),
+        assessment: {
+          complexity: clamp(assessment.complexity, 0, 0, 1),
+          uncertainty: clamp(assessment.uncertainty, 0, 0, 1),
+          risk: clamp(assessment.risk, 0, 0, 1),
+          parallelism: clamp(assessment.parallelism, 0, 0, 1),
+          contextPressure: clamp(assessment.contextPressure, 0, 0, 1),
+          strategy,
+          recommendedSubagents: Math.floor(clamp(assessment.recommendedSubagents, 0, 0, 8)),
+          reasons: stringList(assessment.reasons, 12),
+        },
+        actualSubagents: Math.floor(clamp(item.actualSubagents, 0, 0, 100)),
+        outcome,
+        createdAt,
+        updatedAt: validDate(item.updatedAt, createdAt),
+      })
+    }
+  }
+
+  if (record.sessions && typeof record.sessions === "object" && !Array.isArray(record.sessions)) {
+    for (const [sessionID, rawCheckpoint] of Object.entries(record.sessions as Record<string, unknown>).slice(-300)) {
+      if (!rawCheckpoint || typeof rawCheckpoint !== "object" || Array.isArray(rawCheckpoint)) continue
+      const item = rawCheckpoint as Record<string, unknown>
+      if (typeof item.fingerprint !== "string") continue
+      state.sessions[sessionID.slice(0, 200)] = {
+        fingerprint: item.fingerprint.slice(0, 100),
+        messageCount: Math.floor(clamp(item.messageCount, 0, 0, 1_000_000)),
+        extractionCount: Math.floor(clamp(item.extractionCount, 0, 0, 1_000_000)),
+        updatedAt: validDate(item.updatedAt, now),
+      }
+    }
+  }
+  state.stats = normalizeStats(record.stats)
+  return state
+}
+
 export function clamp(value: unknown, fallback: number, min: number, max: number): number {
   const parsed = typeof value === "number" ? value : Number(value)
   return Number.isFinite(parsed) ? Math.max(min, Math.min(max, parsed)) : fallback
@@ -377,6 +505,13 @@ export function estimateTokens(value: unknown): number {
   try { serialized = typeof value === "string" ? value : JSON.stringify(value) }
   catch { serialized = String(value) }
   return Math.ceil(serialized.length / 3.5)
+}
+
+export function shouldCompactContext(estimatedTokens: number, contextWindow: number, safetyReserve: number): boolean {
+  if (!Number.isFinite(estimatedTokens) || estimatedTokens <= 0) return false
+  const window = Math.max(1, contextWindow)
+  const reserve = Math.max(0.1, Math.min(0.5, safetyReserve))
+  return estimatedTokens / window >= 1 - reserve
 }
 
 export function assessTask(input: {
@@ -478,6 +613,15 @@ export function tokenize(text: string): string[] {
       return word.replace(/(?:ations?|ments?|ings?|ers?|ed|es|s)$/i, "") || word
     })
   return [...new Set(filtered)].slice(0, 80)
+}
+
+function tokenizeAll(text: string): string[] {
+  return (text.toLowerCase().match(/[\p{L}\p{N}][\p{L}\p{N}_+.#/-]{1,}/gu) ?? [])
+    .filter((word) => !STOP.has(word) && word.length <= 64)
+    .map((word) => {
+      if (!/^[a-z]+$/.test(word) || word.length < 5) return word
+      return word.replace(/(?:ations?|ments?|ings?|ers?|ed|es|s)$/i, "") || word
+    })
 }
 
 export function stableID(prefix: string, text: string): string {
@@ -642,13 +786,26 @@ export function latestUserText(messages: unknown[]): string {
   return ""
 }
 
+export function latestUserMessageIndex(messages: unknown[]): number {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const raw = messages[index]
+    if (!raw || typeof raw !== "object") continue
+    const message = raw as Record<string, unknown>
+    if ((message.role === "user" || message.type === "user") && textFromMessage(message).trim()) return index
+  }
+  return Math.max(0, messages.length - 1)
+}
+
 /**
  * Classify only explicit, task-level verification evidence. Ordinary tool
  * errors and an absence of errors are intentionally inconclusive.
  */
-export function classifyVerifiedOutcome(messages: unknown[]): Exclude<DecisionOutcome, "pending"> {
+export function classifyVerifiedOutcome(
+  messages: unknown[],
+  startIndex = Math.max(0, messages.length - 30),
+): Exclude<DecisionOutcome, "pending"> {
   let outcome: Exclude<DecisionOutcome, "pending"> = "inconclusive"
-  for (const raw of messages.slice(-30)) {
+  for (const raw of messages.slice(Math.max(0, startIndex))) {
     if (!raw || typeof raw !== "object") continue
     const message = raw as Record<string, unknown>
     const messageText = textFromMessage(message)
@@ -779,21 +936,36 @@ export function searchMemories(
   const documents = memories.filter((memory) =>
     memory.projectID === projectID || (includeCrossProjectPreferences && memory.kind === "preference"),
   )
+  const documentTokens = new Map(documents.map((memory) => [memory.id, tokenizeAll(memory.text)]))
+  const averageLength = documents.length
+    ? [...documentTokens.values()].reduce((sum, tokens) => sum + tokens.length, 0) / documents.length
+    : 1
   const documentFrequency = new Map<string, number>()
   for (const term of terms) {
-    documentFrequency.set(term, documents.filter((memory) => memory.keywords.includes(term)).length)
+    documentFrequency.set(term, documents.filter((memory) => (documentTokens.get(memory.id) ?? []).includes(term)).length)
   }
   return documents.map((memory) => {
     let lexical = 0
+    const tokens = documentTokens.get(memory.id) ?? []
+    const length = Math.max(1, tokens.length)
     for (const term of terms) {
-      if (!memory.keywords.includes(term)) continue
-      lexical += Math.log(1 + (documents.length + 1) / (1 + (documentFrequency.get(term) ?? 0)))
+      const frequency = tokens.filter((token) => token === term).length
+      if (!frequency) continue
+      const df = documentFrequency.get(term) ?? 0
+      const idf = Math.log(1 + (documents.length - df + 0.5) / (df + 0.5))
+      const k1 = 1.2
+      const b = 0.75
+      lexical += idf * (frequency * (k1 + 1)) / (frequency + k1 * (1 - b + b * length / Math.max(1, averageLength)))
     }
     const coverage = lexical / Math.max(1, terms.length)
+    const normalizedQuery = terms.join(" ")
+    const normalizedText = tokens.join(" ")
+    const phraseBoost = normalizedQuery.length >= 4 && normalizedText.includes(normalizedQuery) ? 0.3 : 0
+    const identifierBoost = terms.some((term) => /[./_+-]/.test(term) && memory.text.toLowerCase().includes(term)) ? 0.2 : 0
     const projectBoost = memory.projectID === projectID ? 0.12 : 0
     // Metadata may rerank a lexical match, but must never manufacture one.
     const score = lexical > 0
-      ? coverage + projectBoost + memory.confidence * 0.08 + Math.min(memory.uses, 10) * 0.005
+      ? coverage + phraseBoost + identifierBoost + projectBoost + memory.confidence * 0.08 + Math.min(memory.uses, 10) * 0.005
       : 0
     return { memory, score }
   }).filter((entry) => entry.score > 0 && entry.score >= minimumScore)
