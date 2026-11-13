@@ -101,8 +101,12 @@ try {
   }
 
   console.log("Installing production dependencies...")
-  const npm = process.platform === "win32" ? "npm.cmd" : "npm"
-  const installed = spawnSync(npm, ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"], {
+  const windows = process.platform === "win32"
+  const npm = windows ? (process.env.ComSpec || "cmd.exe") : "npm"
+  const npmArgs = windows
+    ? ["/d", "/s", "/c", "npm.cmd ci --omit=dev --ignore-scripts --no-audit --no-fund"]
+    : ["ci", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund"]
+  const installed = spawnSync(npm, npmArgs, {
     cwd: staging,
     stdio: "inherit",
   })
@@ -110,7 +114,15 @@ try {
   if (installed.status !== 0) throw new Error(`npm ci exited with status ${installed.status ?? "unknown"}`)
 
   clearExisting(target)
-  fs.renameSync(staging, target)
+  if (process.platform === "win32") {
+    // OpenCode may have file watchers attached to the plugin directory. Windows
+    // can reject a directory rename in that case even after the old tree was
+    // removed, while creating and copying the replacement remains permitted.
+    fs.cpSync(staging, target, { recursive: true })
+    clearExisting(staging)
+  } else {
+    fs.renameSync(staging, target)
+  }
 } catch (error) {
   clearExisting(staging)
   console.error(`Installation failed: ${error instanceof Error ? error.message : String(error)}`)

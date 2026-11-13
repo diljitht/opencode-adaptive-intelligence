@@ -42,8 +42,16 @@ export interface Memory {
   confidence: number
   uses: number
   createdAt: string
+  /** Last time the memory text itself changed. */
+  contentUpdatedAt?: string
+  /** Last time the memory was injected into model context. */
+  lastAccessedAt?: string
+  /** Last time independent verification supported this memory. */
+  lastConfirmedAt?: string
   updatedAt: string
   sourceSession?: string
+  /** Bounded references to the checkpoints or manual writes that support it. */
+  sourceRefs?: string[]
   validFrom?: string
   validUntil?: string
   supersededBy?: string
@@ -178,6 +186,7 @@ export interface PluginOptions {
   minimumMessages: number
   minimumNewMessages: number
   maxMemories: number
+  maxTotalMemories: number
   maxSkills: number
   recallCount: number
   recallCharacters: number
@@ -198,12 +207,18 @@ export interface PluginOptions {
   maxDecisionHistory: number
   /** Share learned skills through one common library folder across projects. */
   sharedSkills: boolean
+  /** Permit preference memories to be recalled outside their source project. */
+  crossProjectPreferences: boolean
   /** Minimum similarity before a learned procedure is merged into an existing skill. */
   skillSimilarityThreshold: number
   /** Uses across at least this many projects promote a skill to the common tier. */
   commonSkillMinProjects: number
   /** Successful uses that promote a skill to the common tier. */
   commonSkillMinUses: number
+  /** Verified outcomes required before a skill can leave its origin project. */
+  minimumSkillVerifiedSuccesses: number
+  /** Minimum verified success ratio required for cross-project skill use. */
+  minimumSkillSuccessRate: number
   /** Extra genre tags for this project, merged with tags detected from the project directory. */
   projectTags: string[]
 }
@@ -216,6 +231,7 @@ export const DEFAULT_OPTIONS: PluginOptions = {
   minimumMessages: 6,
   minimumNewMessages: 4,
   maxMemories: 200,
+  maxTotalMemories: 2_000,
   maxSkills: 30,
   recallCount: 3,
   recallCharacters: 1_600,
@@ -235,9 +251,12 @@ export const DEFAULT_OPTIONS: PluginOptions = {
   contextSafetyReserve: 0.2,
   maxDecisionHistory: 200,
   sharedSkills: true,
+  crossProjectPreferences: false,
   skillSimilarityThreshold: 0.34,
   commonSkillMinProjects: 2,
   commonSkillMinUses: 3,
+  minimumSkillVerifiedSuccesses: 2,
+  minimumSkillSuccessRate: 0.75,
   projectTags: [],
 }
 
@@ -308,6 +327,7 @@ export function readOptions(raw: unknown): PluginOptions {
     minimumMessages: clamp(value.minimumMessages, DEFAULT_OPTIONS.minimumMessages, 2, 100),
     minimumNewMessages: clamp(value.minimumNewMessages, DEFAULT_OPTIONS.minimumNewMessages, 1, 50),
     maxMemories: clamp(value.maxMemories, DEFAULT_OPTIONS.maxMemories, 10, 2_000),
+    maxTotalMemories: clamp(value.maxTotalMemories, DEFAULT_OPTIONS.maxTotalMemories, 100, 20_000),
     maxSkills: clamp(value.maxSkills, DEFAULT_OPTIONS.maxSkills, 1, 200),
     recallCount: clamp(value.recallCount, DEFAULT_OPTIONS.recallCount, 0, 10),
     recallCharacters: clamp(value.recallCharacters, DEFAULT_OPTIONS.recallCharacters, 200, 8_000),
@@ -331,9 +351,12 @@ export function readOptions(raw: unknown): PluginOptions {
     contextSafetyReserve: clamp(value.contextSafetyReserve, DEFAULT_OPTIONS.contextSafetyReserve, 0.1, 0.5),
     maxDecisionHistory: clamp(value.maxDecisionHistory, DEFAULT_OPTIONS.maxDecisionHistory, 20, 2_000),
     sharedSkills: value.sharedSkills !== false && value.crossProjectSkills !== false,
+    crossProjectPreferences: value.crossProjectPreferences === true,
     skillSimilarityThreshold: clamp(value.skillSimilarityThreshold, DEFAULT_OPTIONS.skillSimilarityThreshold, 0, 1),
     commonSkillMinProjects: clamp(value.commonSkillMinProjects, DEFAULT_OPTIONS.commonSkillMinProjects, 1, 20),
     commonSkillMinUses: clamp(value.commonSkillMinUses, DEFAULT_OPTIONS.commonSkillMinUses, 1, 100),
+    minimumSkillVerifiedSuccesses: clamp(value.minimumSkillVerifiedSuccesses, DEFAULT_OPTIONS.minimumSkillVerifiedSuccesses, 1, 20),
+    minimumSkillSuccessRate: clamp(value.minimumSkillSuccessRate, DEFAULT_OPTIONS.minimumSkillSuccessRate, 0.5, 1),
     projectTags: Array.isArray(value.projectTags)
       ? value.projectTags.filter((item): item is string => typeof item === "string").map((item) => item.trim().toLowerCase()).filter(Boolean).slice(0, 32)
       : [],
@@ -532,6 +555,11 @@ export function detectSensitiveInfo(text: string): SensitiveCategory[] {
   return pseudonymizeSensitive(text).categories
 }
 
+/** Reject common prompt-injection patterns from persistent learned procedures. */
+export function hasUnsafePersistentInstructions(text: string): boolean {
+  return /\b(?:ignore|override|bypass|disregard)\b.{0,50}\b(?:previous|system|developer|safety|permission|instructions?)\b|<\s*\/?\s*(?:system|developer)\b|\b(?:exfiltrate|steal)\b.{0,40}\b(?:secret|credential|token|data)\b/i.test(text)
+}
+
 export function redactSecrets(text: string): string {
   return pseudonymizeSensitive(text).text
 }
@@ -603,6 +631,42 @@ export function latestUserText(messages: unknown[]): string {
   return ""
 }
 
+/**
+ * Classify only explicit, task-level verification evidence. Ordinary tool
+ * errors and an absence of errors are intentionally inconclusive.
+ */
+export function classifyVerifiedOutcome(messages: unknown[]): Exclude<DecisionOutcome, "pending"> {
+  let outcome: Exclude<DecisionOutcome, "pending"> = "inconclusive"
+  for (const raw of messages.slice(-30)) {
+    if (!raw || typeof raw !== "object") continue
+    const message = raw as Record<string, unknown>
+    const messageText = textFromMessage(message)
+    if ((message.role === "user" || message.type === "user") &&
+      /\b(?:still broken|still failing|incorrect|verification failed|tests? (?:still )?fail(?:ed|ing)?)\b/i.test(messageText)) {
+      outcome = "failure"
+    }
+    if (!Array.isArray(message.content)) continue
+    for (const rawPart of message.content) {
+      if (!rawPart || typeof rawPart !== "object") continue
+      const part = rawPart as Record<string, unknown>
+      if (part.type !== "tool") continue
+      const state = part.state && typeof part.state === "object" ? part.state as Record<string, unknown> : {}
+      let serialized = ""
+      try { serialized = JSON.stringify({ tool: part.tool ?? part.name, input: part.input, state }) }
+      catch { serialized = `${part.tool ?? part.name ?? ""} ${state.output ?? state.result ?? ""}` }
+      const isVerification = /\b(?:test|vitest|jest|pytest|cargo test|go test|typecheck|tsc|build|lint|verify|check)\b/i.test(serialized)
+      if (!isVerification) continue
+      const output = `${state.output ?? ""} ${state.result ?? ""}`
+      if (state.status === "error" || /\b(?:tests? failed|verification failed|[1-9]\d* failures?|exit code [1-9]\d*)\b/i.test(output)) {
+        outcome = "failure"
+      } else if (state.status === "completed" && /\b(?:tests? passed|verification passed|build (?:passed|succeeded)|typecheck passed|0 failures?|exit code 0|success)\b/i.test(output)) {
+        outcome = "success"
+      }
+    }
+  }
+  return outcome
+}
+
 export function memorySimilarity(a: Memory, b: Memory): number {
   const left = new Set(a.keywords)
   const right = new Set(b.keywords)
@@ -613,9 +677,33 @@ export function memorySimilarity(a: Memory, b: Memory): number {
   return overlap / union
 }
 
-export function addOrMergeMemory(state: AdaptiveState, candidate: Memory, maxMemories: number): string {
+const NEGATION = new Set(["avoid", "cannot", "disable", "disabled", "dont", "never", "no", "not", "prohibit", "without"])
+
+function memoryPolarity(memory: Memory): -1 | 1 {
+  return tokenize(memory.text).some((token) => NEGATION.has(token)) ? -1 : 1
+}
+
+/** Conservative lexical contradiction guard used before deduplication. */
+export function memoriesContradict(a: Memory, b: Memory): boolean {
+  if (a.projectID !== b.projectID || memoryPolarity(a) === memoryPolarity(b)) return false
+  const strip = (memory: Memory) => new Set(memory.keywords.filter((token) => !NEGATION.has(token)))
+  const left = strip(a)
+  const right = strip(b)
+  if (!left.size || !right.size) return false
+  let shared = 0
+  for (const token of left) if (right.has(token)) shared++
+  return shared / Math.min(left.size, right.size) >= 0.6
+}
+
+export function addOrMergeMemory(
+  state: AdaptiveState,
+  candidate: Memory,
+  maxMemoriesPerProject: number,
+  maxTotalMemories = Number.POSITIVE_INFINITY,
+): string {
   const duplicate = state.memories.find((memory) =>
     memory.projectID === candidate.projectID &&
+    !memoriesContradict(memory, candidate) &&
     (memory.id === candidate.id || memorySimilarity(memory, candidate) >= 0.78),
   )
   if (duplicate) {
@@ -623,31 +711,43 @@ export function addOrMergeMemory(state: AdaptiveState, candidate: Memory, maxMem
       duplicate.text = candidate.text
       duplicate.keywords = candidate.keywords
       duplicate.kind = candidate.kind
+      duplicate.contentUpdatedAt = candidate.contentUpdatedAt ?? candidate.updatedAt
     }
     duplicate.confidence = Math.min(1, Math.max(duplicate.confidence, candidate.confidence) + 0.03)
     duplicate.updatedAt = candidate.updatedAt
+    duplicate.lastConfirmedAt = candidate.lastConfirmedAt ?? duplicate.lastConfirmedAt
+    duplicate.sourceRefs = [...new Set([...(duplicate.sourceRefs ?? []), ...(candidate.sourceRefs ?? [])])].slice(-20)
     return duplicate.id
   }
   state.memories.push(candidate)
-  if (state.memories.length > maxMemories) {
+  const projectMemories = state.memories.filter((memory) => memory.projectID === candidate.projectID)
+  if (projectMemories.length > maxMemoriesPerProject) {
+    const keep = new Set(projectMemories.sort((a, b) => memoryValue(b) - memoryValue(a)).slice(0, maxMemoriesPerProject).map((memory) => memory.id))
+    state.memories = state.memories.filter((memory) => memory.projectID !== candidate.projectID || keep.has(memory.id))
+  }
+  if (state.memories.length > maxTotalMemories) {
     state.memories.sort((a, b) => memoryValue(b) - memoryValue(a))
-    state.memories.length = maxMemories
+    state.memories.length = maxTotalMemories
     pruneGraph(state)
   }
   return candidate.id
 }
 
 function memoryValue(memory: Memory): number {
-  const ageDays = Math.max(0, (Date.now() - Date.parse(memory.updatedAt)) / 86_400_000)
+  const contentDate = memory.lastConfirmedAt ?? memory.contentUpdatedAt ?? memory.updatedAt
+  const ageDays = Math.max(0, (Date.now() - Date.parse(contentDate)) / 86_400_000)
   return memory.confidence * 2 + Math.log1p(memory.uses) - ageDays / 365
 }
 
 export function searchMemories(
   memories: Memory[], query: string, projectID: string, limit: number, minimumScore = 0,
+  includeCrossProjectPreferences = false,
 ): Array<{ memory: Memory; score: number }> {
   const terms = tokenize(query)
   if (!terms.length || limit <= 0) return []
-  const documents = memories.filter((memory) => memory.projectID === projectID || memory.kind === "preference")
+  const documents = memories.filter((memory) =>
+    memory.projectID === projectID || (includeCrossProjectPreferences && memory.kind === "preference"),
+  )
   const documentFrequency = new Map<string, number>()
   for (const term of terms) {
     documentFrequency.set(term, documents.filter((memory) => memory.keywords.includes(term)).length)
@@ -740,7 +840,13 @@ export function hybridSearchMemories(
   query: string,
   projectID: string,
   limit: number,
-  options: { minimumScore: number; depth: number; expansion: number; minimumEdgeConfidence: number },
+  options: {
+    minimumScore: number
+    depth: number
+    expansion: number
+    minimumEdgeConfidence: number
+    includeCrossProjectPreferences?: boolean
+  },
 ): HybridMemoryResult[] {
   if (limit <= 0) return []
   const seeds = searchMemories(
@@ -749,6 +855,7 @@ export function hybridSearchMemories(
     projectID,
     Math.max(limit * 3, 8),
     options.minimumScore,
+    options.includeCrossProjectPreferences === true,
   )
   const scored = new Map<string, HybridMemoryResult>()
   for (const seed of seeds) {
@@ -766,7 +873,10 @@ export function hybridSearchMemories(
       for (const edge of adjacent) {
         const neighborID = edge.from === current.memory.id ? edge.to : edge.from
         const neighbor = state.memories.find((memory) => memory.id === neighborID)
-        if (!neighbor || neighbor.validUntil || (neighbor.projectID !== projectID && neighbor.kind !== "preference")) continue
+        if (!neighbor || neighbor.validUntil || (
+          neighbor.projectID !== projectID &&
+          !(options.includeCrossProjectPreferences && neighbor.kind === "preference")
+        )) continue
         const directionPenalty = edge.from === current.memory.id ? 1 : 0.9
         const candidateScore = current.score * 0.68 * edgeValue(edge) * directionPenalty + neighbor.confidence * 0.05
         const previous = scored.get(neighborID)
@@ -1171,12 +1281,19 @@ function ageInDays(iso: string): number {
 /** Recompute whether a skill is broadly useful ("common") or project-specific. */
 export function computeSkillTier(
   skill: LearnedSkill,
-  options: { commonMinProjects: number; commonMinUses: number },
+  options: {
+    commonMinProjects: number
+    commonMinUses: number
+    minimumSkillVerifiedSuccesses?: number
+    minimumSkillSuccessRate?: number
+  },
 ): SkillTier {
   const projects = new Set((skill.projectIDs ?? [skill.projectID]).filter(Boolean)).size
-  const reliable = skill.failures <= skill.successes
-  if (projects >= options.commonMinProjects && reliable && skill.successes > 0) return "common"
-  if (skill.uses >= options.commonMinUses && reliable) return "common"
+  const attempts = skill.successes + skill.failures
+  const minimumSuccesses = options.minimumSkillVerifiedSuccesses ?? options.commonMinUses
+  const minimumRate = options.minimumSkillSuccessRate ?? 0.75
+  const reliable = attempts > 0 && skill.successes >= minimumSuccesses && skill.successes / attempts >= minimumRate
+  if (projects >= options.commonMinProjects && skill.uses >= options.commonMinUses && reliable) return "common"
   return "project"
 }
 
@@ -1307,7 +1424,14 @@ export function selectLibrarySkills(
   library: LearnedSkill[],
   currentProjectID: string,
   currentTags: string[],
-  options: { minSimilarity: number; maxSkills: number; commonMinProjects: number; commonMinUses: number },
+  options: {
+    minSimilarity: number
+    maxSkills: number
+    commonMinProjects: number
+    commonMinUses: number
+    minimumSkillVerifiedSuccesses?: number
+    minimumSkillSuccessRate?: number
+  },
 ): LibrarySkillCandidate[] {
   if (options.maxSkills <= 0) return []
   const candidates: LibrarySkillCandidate[] = []
@@ -1316,10 +1440,17 @@ export function selectLibrarySkills(
     const similarity = currentTags.length && tags.length ? projectSimilarity(currentTags, tags) : 0
     const known = (skill.projectIDs ?? [skill.projectID]).includes(currentProjectID)
     const tier = skill.tier ?? computeSkillTier(skill, options)
+    const attempts = skill.successes + skill.failures
+    const verified =
+      skill.successes >= (options.minimumSkillVerifiedSuccesses ?? options.commonMinUses) &&
+      attempts > 0 &&
+      skill.successes / attempts >= (options.minimumSkillSuccessRate ?? 0.75)
+    // Candidate skills remain available in projects that produced or used them,
+    // but cannot spread to another project until outcomes verify them.
+    if (!known && !verified) continue
     const matches = known || similarity >= options.minSimilarity
     if (tier !== "common" && !matches) continue
     const recency = Math.max(0.7, Math.exp(-ageInDays(skill.updatedAt) / 365))
-    const attempts = skill.successes + skill.failures
     const successRate = attempts > 0 ? skill.successes / attempts : 0.5
     const score =
       (tier === "common" ? 1.2 : 0) +

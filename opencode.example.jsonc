@@ -20,9 +20,13 @@
         "toolOutputCharacters": 6000,
         "recentMessagesToKeep": 8,
         "sharedSkills": true,
+        "crossProjectPreferences": false,
         "skillSimilarityThreshold": 0.34,
         "commonSkillMinProjects": 2,
-        "commonSkillMinUses": 3
+        "commonSkillMinUses": 3,
+        "minimumSkillVerifiedSuccesses": 2,
+        "minimumSkillSuccessRate": 0.75,
+        "maxTotalMemories": 2000
       }
     }
   ]

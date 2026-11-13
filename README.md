@@ -55,10 +55,12 @@ Memories are:
 - Ranked by relevance, confidence, usage, recency, and project scope
 - Connected by typed relationships such as `solved-by`, `depends-on`, `supports`, `contradicts`, and `supersedes`
 - Retained with provenance and temporal validity instead of being destructively replaced
+- Recalled once per user task rather than only once per session
+- Isolated by project by default, including preferences
 
 Recall uses lexical seed retrieval followed by at most two graph hops and diversity-aware reranking. Only a small, character-limited evidence block is added to model context. Recalled information is explicitly marked as evidence that must be verified against the current project.
 
-A model-proposed `supersedes` relationship must be independently confirmed before older evidence is excluded from normal recall.
+A model-proposed `supersedes` relationship must be independently confirmed before older evidence is excluded from normal recall. Access time, content-update time, and independent-confirmation time are tracked separately so recalling stale information does not make it appear newly verified.
 
 ### Learned OpenCode skills
 
@@ -78,7 +80,7 @@ Skills are learned by analyzing the problem at hand, then distilled and refined 
 - Every library skill is written to the standard skills directory. Skills selected for the current project are advertised to the model (`metadata.opencode/autoinvoke: true`); the rest stay registered but hidden (`false`). Skill visibility therefore reflects the project synced most recently.
 - When a session reveals a reusable procedure that is not already in the library, a new skill is created from the analysis. When a procedure is already present (matched by id or by at least 60% text similarity), the richer version is **merged into the existing skill** instead of creating a duplicate: the better procedure wins, applicability tags and evidence are unioned, the version is bumped, and a short refinement history is kept.
 - Skills carry coarse **genre tags** derived deterministically from marker files and manifests (for example `node`, `typescript`, `react`, `python`, `django`, `rust`, `go`, `docker`). Extra tags can be supplied with `projectTags`.
-- Two tiers keep the library useful without flooding a project: broadly useful, repeatedly successful skills are promoted to `common` and surfaced everywhere; niche skills stay `project`-scoped and are surfaced only in projects whose tags match (`skillSimilarityThreshold`, Jaccard over tag sets). At most `maxSkills` are registered in one project.
+- Two tiers keep the library useful without flooding a project: skills remain quarantined in projects that produced or used them until repeated verified outcomes meet the configured success threshold. Only then may broadly useful skills be promoted to `common` and surfaced elsewhere. At most `maxSkills` are registered in one project.
 - The library is read at session start and re-read on demand (`sync`), so skills learned by other projects become available without restarting.
 - Sharing is local-only; nothing is sent over the network. Sensitive-data detection still applies, so content that looks like a secret is rejected.
 - Disable with `sharedSkills: false`, which restricts the agent to skills learned in the current project.
@@ -194,7 +196,8 @@ All options are optional.
 | `minimumMessages` | `6` | Minimum session messages before initial extraction. |
 | `minimumNewMessages` | `4` | Additional messages required before another extraction. |
 | `extractionMaxTokens` | `1200` | Maximum output tokens for a learning request. |
-| `maxMemories` | `200` | Maximum stored memories. |
+| `maxMemories` | `200` | Maximum stored memories per project. |
+| `maxTotalMemories` | `2000` | Safety cap across a state store or shared-preference store. |
 | `maxEdges` | `800` | Maximum stored memory relationships. |
 | `maxSkills` | `30` | Maximum library skills registered in one project at once. |
 | `recallCount` | `3` | Maximum memories recalled per session. |
@@ -210,9 +213,12 @@ All options are optional.
 | `localProviders` | See below | Provider IDs explicitly permitted to receive detected values locally. |
 | `outboundToolPatterns` | See below | Tool-name fragments treated as outbound network tools. |
 | `sharedSkills` | `true` | Share learned skills through one common library folder across projects. |
+| `crossProjectPreferences` | `false` | Allow preference memories to be recalled outside their source project. |
 | `skillSimilarityThreshold` | `0.34` | Minimum Jaccard similarity before a new procedure is merged into an existing skill. |
 | `commonSkillMinProjects` | `2` | Uses across at least this many projects promote a skill to the `common` tier. |
 | `commonSkillMinUses` | `3` | Successful uses that promote a skill to the `common` tier. |
+| `minimumSkillVerifiedSuccesses` | `2` | Verified successful outcomes required before cross-project skill use. |
+| `minimumSkillSuccessRate` | `0.75` | Minimum verified success ratio required for cross-project skill use. |
 | `projectTags` | `[]` | Extra genre tags for this project, merged with tags detected from the project directory. |
 
 Default local providers:
@@ -294,6 +300,22 @@ npm test
 npm run build
 npm pack --dry-run
 ```
+
+### Paired evaluation
+
+Use paired control/plugin task runs to measure whether the plugin improves outcomes:
+
+```sh
+npm run evaluate -- results.jsonl
+```
+
+Each JSONL row has the shape:
+
+```json
+{"task":"task-id","variant":"control","completed":1,"verified":1,"tokens":12000,"incorrectRecalls":0,"regression":0}
+```
+
+Provide one `control` and one `plugin` row per task. The report compares completion, verification, token usage, incorrect recalls, and regressions. This avoids treating additional context or model calls as evidence of improvement.
 
 Core behavior and privacy tests are in `test/core.test.ts`.
 

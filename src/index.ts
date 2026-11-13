@@ -6,6 +6,7 @@ import {
   addOrMergeMemory,
   addOrMergeEdge,
   assessTask,
+  classifyVerifiedOutcome,
   compactOldToolOutputs,
   computeSkillTier,
   decisionGuidance,
@@ -14,6 +15,7 @@ import {
   emptyState,
   estimateTokens,
   fingerprint,
+  hasUnsafePersistentInstructions,
   hybridSearchMemories,
   inferMemoryEdges,
   latestUserText,
@@ -43,7 +45,9 @@ import {
   type SensitiveCategory,
 } from "./core.js"
 
-const STATE_KEY = "adaptive/state-v1"
+const LEGACY_STATE_KEY = "adaptive/state-v1"
+const STATE_KEY_PREFIX = "adaptive/state-v2"
+const SHARED_PREFERENCES_KEY = "adaptive/shared-preferences-v1"
 // When a newly learned procedure is at least this similar to an existing library
 // skill, it is distilled into that skill instead of creating a near-duplicate.
 const SKILL_MERGE_SIMILARITY = 0.6
@@ -98,7 +102,25 @@ export default Plugin.define({
     const libraryIndexFile = path.join(skillsDir, ".adaptive-intelligence.json")
     fs.mkdirSync(skillsDir, { recursive: true })
 
-    const stored = await ctx.storage.get(STATE_KEY) as any
+    const stateKey = `${STATE_KEY_PREFIX}/${projectID}`
+    let stored = await ctx.storage.get(stateKey) as any
+    if (!stored) {
+      const legacy = await ctx.storage.get(LEGACY_STATE_KEY) as any
+      if (legacy?.version === 3 && Array.isArray(legacy.memories)) {
+        const memories = legacy.memories.filter((memory: Memory) => memory.projectID === projectID)
+        const ids = new Set(memories.map((memory: Memory) => memory.id))
+        stored = {
+          ...legacy,
+          memories,
+          edges: Array.isArray(legacy.edges)
+            ? legacy.edges.filter((edge: MemoryEdge) => ids.has(edge.from) && ids.has(edge.to))
+            : [],
+          // Session IDs are globally unique; retaining these records is safe and
+          // avoids discarding in-flight learning checkpoints during migration.
+          skills: Array.isArray(legacy.skills) ? legacy.skills : [],
+        }
+      }
+    }
     let state: AdaptiveState
     if (stored?.version === 3 && Array.isArray(stored.memories) && Array.isArray(stored.edges) && Array.isArray(stored.skills) && Array.isArray(stored.decisions)) {
       state = stored as AdaptiveState
@@ -119,18 +141,41 @@ export default Plugin.define({
     // relevant here. Detected tags are merged with explicitly configured ones.
     const projectTags = [...new Set([...detectProjectTags(projectDirectory), ...options.projectTags])].sort().slice(0, 32)
 
-    const injected = new Set<string>()
+    const recalledTasks = new Map<string, string>()
     const extracting = new Set<string>()
     const usedSkills = new Map<string, Set<string>>()
     const sensitiveSessions = new Map<string, Set<SensitiveCategory>>()
     const warnedSessions = new Set<string>()
     const plannedTasks = new Map<string, string>()
     let writeQueue = Promise.resolve()
+    const sharedRaw = options.crossProjectPreferences
+      ? await ctx.storage.get(SHARED_PREFERENCES_KEY) as any
+      : null
+    let sharedPreferences: Memory[] = Array.isArray(sharedRaw?.memories)
+      ? sharedRaw.memories.filter((memory: Memory) => memory?.kind === "preference")
+      : []
 
     const save = async () => {
       const snapshot = JSON.parse(JSON.stringify(state)) as AdaptiveState
-      writeQueue = writeQueue.then(() => ctx.storage.set(STATE_KEY, snapshot as any)).catch(() => undefined)
+      writeQueue = writeQueue.then(() => ctx.storage.set(stateKey, snapshot as any)).catch(() => undefined)
       await writeQueue
+    }
+    const saveSharedPreferences = async () => {
+      if (!options.crossProjectPreferences) return
+      // Re-read immediately before writing and union by stable memory ID. This
+      // minimizes lost updates when multiple project instances are active.
+      const current = await ctx.storage.get(SHARED_PREFERENCES_KEY) as any
+      const merged = new Map<string, Memory>()
+      for (const memory of [
+        ...(Array.isArray(current?.memories) ? current.memories : []),
+        ...sharedPreferences,
+      ] as Memory[]) {
+        if (memory?.kind !== "preference" || !memory.id) continue
+        const previous = merged.get(memory.id)
+        if (!previous || memory.updatedAt >= previous.updatedAt) merged.set(memory.id, memory)
+      }
+      sharedPreferences = [...merged.values()]
+      await ctx.storage.set(SHARED_PREFERENCES_KEY, { version: 1, memories: sharedPreferences } as any)
     }
     // Persist schema hydration and startup scrubbing before any model request can run.
     await save()
@@ -138,6 +183,8 @@ export default Plugin.define({
     const tierOptions = {
       commonMinProjects: options.commonSkillMinProjects,
       commonMinUses: options.commonSkillMinUses,
+      minimumSkillVerifiedSuccesses: options.minimumSkillVerifiedSuccesses,
+      minimumSkillSuccessRate: options.minimumSkillSuccessRate,
     }
 
     const listDir = (directory: string): string[] => {
@@ -235,7 +282,22 @@ export default Plugin.define({
     const writeLibrary = (): void => {
       try {
         fs.mkdirSync(skillsDir, { recursive: true })
-        const visible = new Set(selectedSkills.map((skill) => skill.id))
+        // Merge the latest manifest before each atomic replacement so another
+        // active project cannot be silently erased by this project's snapshot.
+        try {
+          const disk = parseLibraryIndex(JSON.parse(fs.readFileSync(libraryIndexFile, "utf8"))).skills
+          for (const persisted of disk) {
+            const index = library.findIndex((skill) => skill.id === persisted.id)
+            if (index < 0) library.push(persisted)
+            else if (persisted.updatedAt > library[index]!.updatedAt) library[index] = persisted
+          }
+        } catch { /* first write or unreadable prior manifest */ }
+        // Only verified common skills are globally advertised. Project-specific
+        // selections are announced per request below, avoiding last-project-wins
+        // visibility races in the shared skills directory.
+        const visible = new Set(library
+          .filter((skill) => computeSkillTier(skill, tierOptions) === "common")
+          .map((skill) => skill.id))
         for (const skill of library) writeSkillFile(skill, visible.has(skill.id))
         const index: LibraryIndex = { version: 1, updatedAt: new Date().toISOString(), skills: library }
         const temp = `${libraryIndexFile}.${process.pid}.tmp`
@@ -399,17 +461,34 @@ export default Plugin.define({
         }
       }
 
-      if (injected.has(event.sessionID) || options.recallCount === 0) return
       const query = redactSecrets(latestUserText(event.messages as unknown[]))
-      const matches = hybridSearchMemories(state, query, projectID, options.recallCount, {
+      const recallFingerprint = stableID("task", `${event.sessionID}:${query}`)
+      if (!query || recalledTasks.get(event.sessionID) === recallFingerprint) return
+      recalledTasks.set(event.sessionID, recallFingerprint)
+      if (selectedSkills.length) {
+        event.system.push({
+          type: "text",
+          text: [
+            "<adaptive-intelligence-skills>",
+            "Locally learned candidate procedures available for this task; load one only when its description clearly applies:",
+            ...selectedSkills.map((skill) => `- ${skill.id}: ${skill.description}`),
+            "</adaptive-intelligence-skills>",
+          ].join("\n"),
+        })
+      }
+      if (options.recallCount === 0) return
+      const recallState: AdaptiveState = sharedPreferences.length
+        ? { ...state, memories: [...state.memories, ...sharedPreferences.filter((memory) => !state.memories.some((local) => local.id === memory.id))] }
+        : state
+      const matches = hybridSearchMemories(recallState, query, projectID, options.recallCount, {
         minimumScore: options.minimumRecallScore,
         depth: options.graphDepth,
         expansion: options.graphExpansion,
         minimumEdgeConfidence: options.minimumEdgeConfidence,
+        includeCrossProjectPreferences: options.crossProjectPreferences,
       })
       state.stats.graphTraversals++
       if (!matches.length) {
-        injected.add(event.sessionID)
         return
       }
       let used = 0
@@ -421,7 +500,7 @@ export default Plugin.define({
         lines.push(line)
         used += line.length
         match.memory.uses++
-        match.memory.updatedAt = new Date().toISOString()
+        match.memory.lastAccessedAt = new Date().toISOString()
       }
       if (lines.length) {
         event.system.push({
@@ -431,8 +510,8 @@ export default Plugin.define({
         state.stats.injectedMemories += lines.length
         state.stats.graphExpandedMemories += matches.filter((match) => match.source === "graph").length
         void save()
+        if (matches.some((match) => match.memory.projectID !== projectID)) void saveSharedPreferences()
       }
-      injected.add(event.sessionID)
     })
 
     await ctx.session.hook("generate", (event) => {
@@ -483,11 +562,19 @@ export default Plugin.define({
             confidence: numberValue(candidate.confidence, 0.65),
             uses: 0,
             createdAt: now,
+            contentUpdatedAt: now,
             updatedAt: now,
             sourceSession: sessionID,
+            sourceRefs: [`session:${sessionID}:checkpoint:${fp}`],
             validFrom: now,
           }
-          memoryIDsByIndex.push(addOrMergeMemory(state, memory, options.maxMemories))
+          memoryIDsByIndex.push(addOrMergeMemory(state, memory, options.maxMemories, options.maxTotalMemories))
+          if (options.crossProjectPreferences && memory.kind === "preference") {
+            const sharedState = emptyState()
+            sharedState.memories = sharedPreferences
+            addOrMergeMemory(sharedState, { ...memory }, options.maxMemories, options.maxTotalMemories)
+            sharedPreferences = sharedState.memories
+          }
         }
 
         const freshIDs = memoryIDsByIndex.filter((id): id is string => !!id)
@@ -512,10 +599,13 @@ export default Plugin.define({
           if (state.edges.length > before) state.stats.graphEdgesCreated++
         }
 
-        if (options.autoSkills && parsed.skill) {
+        if (options.autoSkills && parsed.skill && classifyVerifiedOutcome(messages) === "success") {
           const raw = asRecord(parsed.skill)
           const proposedSkill = [raw.name, raw.description, raw.content, ...(Array.isArray(raw.triggerTerms) ? raw.triggerTerms : [])].join("\n")
-          if (options.sensitiveDataProtection && detectSensitiveInfo(proposedSkill).length) {
+          if (
+            hasUnsafePersistentInstructions(proposedSkill) ||
+            (options.sensitiveDataProtection && detectSensitiveInfo(proposedSkill).length)
+          ) {
             state.stats.blockedMemoryWrites++
             raw.content = ""
           }
@@ -565,6 +655,7 @@ export default Plugin.define({
           state.sessions = Object.fromEntries(sessionEntries.slice(0, 300))
         }
         await save()
+        await saveSharedPreferences()
       } catch (error) {
         state.stats.extractionErrors++
         await save()
@@ -592,7 +683,6 @@ export default Plugin.define({
       if (!skill) return
       skill.uses++
       skill.updatedAt = new Date().toISOString()
-      skill.projectIDs = [...new Set([...(skill.projectIDs ?? [skill.projectID]), projectID].filter(Boolean))]
       skill.tier = computeSkillTier(skill, tierOptions)
       const session = usedSkills.get(event.sessionID) ?? new Set<string>()
       session.add(id)
@@ -624,21 +714,17 @@ export default Plugin.define({
       if (!ids?.size) return
       try {
         const messages = await ctx.session.context({ sessionID: event.sessionID }) as Array<Record<string, unknown>>
-        const recent = messages.slice(-20)
-        const failed = recent.some((message) => {
-          const text = typeof message.text === "string" ? message.text : ""
-          if (/\b(wrong|still broken|still failing|incorrect|try again)\b/i.test(text)) return true
-          return Array.isArray(message.content) && message.content.some((part) => {
-            const value = asRecord(part)
-            const status = asRecord(value.state).status
-            return value.type === "tool" && status === "error"
-          })
-        })
+        const outcome = classifyVerifiedOutcome(messages)
+        if (outcome === "inconclusive") return
+        const failed = outcome === "failure"
         for (const id of ids) {
           const skill = library.find((candidate) => candidate.id === id)
           if (!skill) continue
           if (failed) skill.failures++
-          else skill.successes++
+          else {
+            skill.successes++
+            skill.projectIDs = [...new Set([...(skill.projectIDs ?? [skill.projectID]), projectID].filter(Boolean))]
+          }
           skill.updatedAt = new Date().toISOString()
           skill.tier = computeSkillTier(skill, tierOptions)
           const evidence = new Set(skill.evidenceMemoryIDs ?? [])
@@ -646,7 +732,7 @@ export default Plugin.define({
             if (!evidence.has(memory.id)) continue
             memory.uses++
             memory.confidence = Math.max(0.1, Math.min(1, memory.confidence + (failed ? -0.02 : 0.01)))
-            memory.updatedAt = skill.updatedAt
+            if (!failed) memory.lastConfirmedAt = skill.updatedAt
           }
           for (const edge of state.edges) {
             if (!evidence.has(edge.from) || !evidence.has(edge.to)) continue
@@ -666,29 +752,10 @@ export default Plugin.define({
       if (!decision) return
       try {
         const messages = await ctx.session.context({ sessionID: event.sessionID }) as Array<Record<string, unknown>>
-        const recent = messages.slice(-24)
-        const failed = recent.some((message) => {
-          const text = typeof message.text === "string" ? message.text : ""
-          if (/\b(?:still broken|still failing|incorrect|unable to complete|could not complete|failed to)\b/i.test(text)) return true
-          return Array.isArray(message.content) && message.content.some((part) => {
-            const value = asRecord(part)
-            return value.type === "tool" && asRecord(value.state).status === "error"
-          })
-        })
-        const verified = recent.some((message) => {
-          const text = typeof message.text === "string" ? message.text : ""
-          if (/\b(?:tests? passed|build passed|typecheck passed|verified successfully|verification passed)\b/i.test(text)) return true
-          return Array.isArray(message.content) && message.content.some((part) => {
-            const value = asRecord(part)
-            const stateValue = asRecord(value.state)
-            const output = `${stateValue.output ?? ""} ${stateValue.result ?? ""}`
-            return value.type === "tool" && stateValue.status === "completed" && /\b(?:pass(?:ed)?|success|0 failures?|exit code 0)\b/i.test(output)
-          })
-        })
-        decision.outcome = failed ? "failure" : verified ? "success" : "inconclusive"
+        decision.outcome = classifyVerifiedOutcome(messages)
         decision.updatedAt = new Date().toISOString()
-        if (failed) state.stats.decisionFailures++
-        else if (verified) state.stats.decisionSuccesses++
+        if (decision.outcome === "failure") state.stats.decisionFailures++
+        else if (decision.outcome === "success") state.stats.decisionSuccesses++
         else state.stats.decisionInconclusive++
         await save()
       } catch { /* decision telemetry must not affect the session */ }
@@ -743,8 +810,20 @@ export default Plugin.define({
             const now = new Date().toISOString()
             addOrMergeMemory(state, {
               id: stableID("mem", `${projectID}:${kind}:${text.toLowerCase()}`), kind, text, keywords: tokenize(text),
-              projectID, confidence: 0.9, uses: 0, createdAt: now, updatedAt: now,
-            }, options.maxMemories)
+              projectID, confidence: 0.9, uses: 0, createdAt: now, contentUpdatedAt: now,
+              lastConfirmedAt: now, updatedAt: now, sourceRefs: ["manual"],
+            }, options.maxMemories, options.maxTotalMemories)
+            if (options.crossProjectPreferences && kind === "preference") {
+              const memory = state.memories.find((candidate) =>
+                candidate.id === stableID("mem", `${projectID}:${kind}:${text.toLowerCase()}`))
+              if (memory) {
+                const sharedState = emptyState()
+                sharedState.memories = sharedPreferences
+                addOrMergeMemory(sharedState, { ...memory }, options.maxMemories, options.maxTotalMemories)
+                sharedPreferences = sharedState.memories
+                await saveSharedPreferences()
+              }
+            }
             await save()
             return { content: "Memory stored." }
           }
@@ -752,8 +831,10 @@ export default Plugin.define({
             const id = stringValue(input.id, 100)
             const before = state.memories.length
             state.memories = state.memories.filter((memory) => memory.id !== id)
+            sharedPreferences = sharedPreferences.filter((memory) => memory.id !== id)
             pruneGraph(state, options.maxEdges)
             await save()
+            await saveSharedPreferences()
             return { content: before === state.memories.length ? "Memory not found." : "Memory removed." }
           }
           if (action === "stats") {
