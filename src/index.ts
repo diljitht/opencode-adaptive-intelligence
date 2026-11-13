@@ -1,4 +1,4 @@
-import { Plugin } from "@opencode/plugin"
+import { Plugin, Skill } from "@opencode/plugin"
 import * as fs from "node:fs"
 import * as os from "node:os"
 import * as path from "node:path"
@@ -18,6 +18,7 @@ import {
   hasUnsafePersistentInstructions,
   hybridSearchMemories,
   inferMemoryEdges,
+  isValidLibrarySkillID,
   latestUserText,
   librarySkillID,
   mergeLibrarySkill,
@@ -100,6 +101,7 @@ export default Plugin.define({
       : path.join(os.homedir(), ".config", "opencode")
     const skillsDir = path.join(configRoot, "skills")
     const libraryIndexFile = path.join(skillsDir, ".adaptive-intelligence.json")
+    const MAX_LIBRARY_INDEX_BYTES = 2_000_000
     fs.mkdirSync(skillsDir, { recursive: true })
 
     const stateKey = `${STATE_KEY_PREFIX}/${projectID}`
@@ -143,11 +145,14 @@ export default Plugin.define({
 
     const recalledTasks = new Map<string, string>()
     const extracting = new Set<string>()
-    const usedSkills = new Map<string, Set<string>>()
+    const usedSkills = new Map<string, { taskFingerprint: string; ids: Set<string> }>()
     const sensitiveSessions = new Map<string, Set<SensitiveCategory>>()
     const warnedSessions = new Set<string>()
     const plannedTasks = new Map<string, string>()
+    const activeTasks = new Map<string, string>()
+    const extractionFailures = new Map<string, { attempts: number; retryAfter: number }>()
     let writeQueue = Promise.resolve()
+    let lastPersistenceWarning = 0
     const sharedRaw = options.crossProjectPreferences
       ? await ctx.storage.get(SHARED_PREFERENCES_KEY) as any
       : null
@@ -157,7 +162,14 @@ export default Plugin.define({
 
     const save = async () => {
       const snapshot = JSON.parse(JSON.stringify(state)) as AdaptiveState
-      writeQueue = writeQueue.then(() => ctx.storage.set(stateKey, snapshot as any)).catch(() => undefined)
+      writeQueue = writeQueue.then(() => ctx.storage.set(stateKey, snapshot as any)).catch((error) => {
+        state.stats.persistenceErrors++
+        const now = Date.now()
+        if (now - lastPersistenceWarning > 30_000) {
+          lastPersistenceWarning = now
+          console.warn(`[adaptive-intelligence] state persistence failed: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      })
       await writeQueue
     }
     const saveSharedPreferences = async () => {
@@ -191,15 +203,38 @@ export default Plugin.define({
       try { return fs.readdirSync(directory) } catch { return [] }
     }
 
+    const readLibraryIndex = (): LibraryIndex => {
+      const stat = fs.statSync(libraryIndexFile)
+      if (!stat.isFile() || stat.size > MAX_LIBRARY_INDEX_BYTES) throw new Error("Adaptive skill manifest is too large")
+      return parseLibraryIndex(JSON.parse(fs.readFileSync(libraryIndexFile, "utf8")))
+    }
+
+    const safeSkillDirectory = (id: string): string => {
+      if (!isValidLibrarySkillID(id)) throw new Error(`Unsafe adaptive skill ID: ${id}`)
+      const directory = path.resolve(skillsDir, id)
+      const relative = path.relative(path.resolve(skillsDir), directory)
+      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) throw new Error(`Unsafe adaptive skill path: ${id}`)
+      try {
+        if (fs.lstatSync(directory).isSymbolicLink()) throw new Error(`Refusing symbolic-link skill directory: ${id}`)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+      }
+      return directory
+    }
+
     const writeSkillFile = (skill: LearnedSkill, visible: boolean): string => {
-      const directory = path.join(skillsDir, skill.id)
+      const directory = safeSkillDirectory(skill.id)
       fs.mkdirSync(directory, { recursive: true })
+      const directoryStat = fs.lstatSync(directory)
+      if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) {
+        throw new Error(`Refusing unsafe adaptive skill directory: ${skill.id}`)
+      }
       const file = path.join(directory, "SKILL.md")
       const projects = (skill.projectIDs ?? [skill.projectID]).filter(Boolean)
       const markdown = [
         "---",
-        `name: ${skill.name.replace(/[\r\n]/g, " ")}`,
-        `description: ${(skill.description ?? "").replace(/[\r\n]/g, " ")}`,
+        `name: ${JSON.stringify(skill.name.replace(/[\r\n]/g, " "))}`,
+        `description: ${JSON.stringify((skill.description ?? "").replace(/[\r\n]/g, " "))}`,
         "metadata:",
         "  provenance: opencode-adaptive-intelligence",
         // OpenCode advertises only skills whose autoinvoke is not false. Every
@@ -208,22 +243,26 @@ export default Plugin.define({
         `  opencode/autoinvoke: ${visible ? "true" : "false"}`,
         `  tier: ${skill.tier ?? "project"}`,
         `  version: ${skill.version}`,
-        `  origin: ${skill.projectID}`,
-        `  projects: ${projects.join(",")}`,
-        `  tags: ${(skill.tags ?? []).join(",")}`,
+        `  origin: ${JSON.stringify(skill.projectID)}`,
+        `  projects: ${JSON.stringify(projects.join(","))}`,
+        `  tags: ${JSON.stringify((skill.tags ?? []).join(","))}`,
         "---",
         "",
         skill.content,
         "",
       ].join("\n")
-      fs.writeFileSync(file, markdown, "utf8")
+      const temp = `${file}.${process.pid}.tmp`
+      fs.writeFileSync(temp, markdown, { encoding: "utf8", mode: 0o600 })
+      fs.renameSync(temp, file)
       return file
     }
 
     const removeSkillFile = (id: string): void => {
+      if (!isValidLibrarySkillID(id)) return
       try {
-        fs.unlinkSync(path.join(skillsDir, id, "SKILL.md"))
-        fs.rmdirSync(path.join(skillsDir, id))
+        const directory = safeSkillDirectory(id)
+        fs.unlinkSync(path.join(directory, "SKILL.md"))
+        fs.rmdirSync(directory)
       } catch { /* absent or not plugin-owned */ }
     }
 
@@ -234,7 +273,7 @@ export default Plugin.define({
       const skills: LearnedSkill[] = []
       const seen = new Set<string>()
       const add = (skill: LearnedSkill): void => {
-        if (!skill.id || seen.has(skill.id)) return
+        if (!isValidLibrarySkillID(skill.id) || seen.has(skill.id)) return
         if (options.sensitiveDataProtection && detectSensitiveInfo([skill.name, skill.description, skill.content, ...(skill.triggerTerms ?? [])].join("\n")).length) {
           state.stats.blockedMemoryWrites++
           return
@@ -244,7 +283,7 @@ export default Plugin.define({
       }
       let manifestRead = false
       try {
-        const parsed = parseLibraryIndex(JSON.parse(fs.readFileSync(libraryIndexFile, "utf8")))
+        const parsed = readLibraryIndex()
         manifestRead = true
         for (const skill of parsed.skills) add(skill)
       } catch { /* manifest missing or unreadable */ }
@@ -285,30 +324,70 @@ export default Plugin.define({
         // Merge the latest manifest before each atomic replacement so another
         // active project cannot be silently erased by this project's snapshot.
         try {
-          const disk = parseLibraryIndex(JSON.parse(fs.readFileSync(libraryIndexFile, "utf8"))).skills
+          const disk = readLibraryIndex().skills
           for (const persisted of disk) {
             const index = library.findIndex((skill) => skill.id === persisted.id)
             if (index < 0) library.push(persisted)
-            else if (persisted.updatedAt > library[index]!.updatedAt) library[index] = persisted
+            else {
+              const local = library[index]!
+              const newer = persisted.updatedAt > local.updatedAt ? persisted : local
+              library[index] = {
+                ...newer,
+                uses: Math.max(local.uses, persisted.uses),
+                successes: Math.max(local.successes, persisted.successes),
+                failures: Math.max(local.failures, persisted.failures),
+                version: Math.max(local.version, persisted.version),
+                tags: [...new Set([...(local.tags ?? []), ...(persisted.tags ?? [])])].slice(0, 32),
+                projectIDs: [...new Set([
+                  ...(local.projectIDs ?? [local.projectID]),
+                  ...(persisted.projectIDs ?? [persisted.projectID]),
+                ].filter(Boolean))],
+                evidenceMemoryIDs: [...new Set([
+                  ...(local.evidenceMemoryIDs ?? []),
+                  ...(persisted.evidenceMemoryIDs ?? []),
+                ])].slice(-20),
+                history: [...(persisted.history ?? []), ...(local.history ?? [])]
+                  .filter((entry, position, entries) =>
+                    entries.findIndex((candidate) =>
+                      candidate.version === entry.version && candidate.at === entry.at && candidate.note === entry.note,
+                    ) === position)
+                  .sort((a, b) => a.at.localeCompare(b.at))
+                  .slice(-20),
+              }
+            }
           }
         } catch { /* first write or unreadable prior manifest */ }
-        // Only verified common skills are globally advertised. Project-specific
-        // selections are announced per request below, avoiding last-project-wins
-        // visibility races in the shared skills directory.
-        const visible = new Set(library
-          .filter((skill) => computeSkillTier(skill, tierOptions) === "common")
-          .map((skill) => skill.id))
-        for (const skill of library) writeSkillFile(skill, visible.has(skill.id))
+        // Files are durable library entries only. The location-scoped skill
+        // transform below controls which entries are advertised in this project.
+        for (const skill of library) writeSkillFile(skill, false)
         const index: LibraryIndex = { version: 1, updatedAt: new Date().toISOString(), skills: library }
         const temp = `${libraryIndexFile}.${process.pid}.tmp`
-        fs.writeFileSync(temp, JSON.stringify(index), "utf8")
+        fs.writeFileSync(temp, JSON.stringify(index), { encoding: "utf8", mode: 0o600 })
         fs.renameSync(temp, libraryIndexFile)
-      } catch { /* library persistence is best-effort */ }
+      } catch (error) {
+        state.stats.persistenceErrors++
+        const now = Date.now()
+        if (now - lastPersistenceWarning > 30_000) {
+          lastPersistenceWarning = now
+          console.warn(`[adaptive-intelligence] skill library persistence failed: ${error instanceof Error ? error.message : String(error)}`)
+        }
+      }
     }
 
-    // Library skills selected for this project. OpenCode advertises the matching
-    // skill files; every other library skill is written hidden.
+    // OpenCode advertises only the library skills selected for this project.
     let selectedSkills: LearnedSkill[] = []
+    await ctx.skill.transform((editor) => {
+      for (const skill of selectedSkills) {
+        editor.add({
+          id: Skill.ID.make(skill.id),
+          name: Skill.Name.make(skill.name),
+          description: skill.description,
+          autoinvoke: true,
+          path: Skill.Info.fields.path.make(path.join(skillsDir, skill.id, "SKILL.md")),
+          content: skill.content,
+        })
+      }
+    })
 
     const refreshSelection = async (): Promise<void> => {
       if (options.sharedSkills) {
@@ -318,7 +397,9 @@ export default Plugin.define({
           ...tierOptions,
         }).map((candidate) => candidate.skill)
       } else {
-        selectedSkills = library.filter((skill) => (skill.projectIDs ?? [skill.projectID]).includes(projectID))
+        selectedSkills = library
+          .filter((skill) => (skill.projectIDs ?? [skill.projectID]).includes(projectID))
+          .slice(0, options.maxSkills)
       }
       for (const skill of selectedSkills) {
         if (!skill.tier) skill.tier = computeSkillTier(skill, tierOptions)
@@ -369,6 +450,11 @@ export default Plugin.define({
         const scan = sanitizeMessageText(copy)
         scan.categories.forEach((category) => categories.add(category))
       }
+      for (const part of event.system) {
+        const copy = structuredClone(part)
+        const scan = sanitizeMessageText(copy)
+        scan.categories.forEach((category) => categories.add(category))
+      }
       if (!categories.size) return
       sensitiveSessions.set(event.sessionID, categories)
 
@@ -376,6 +462,7 @@ export default Plugin.define({
       if (!local) {
         let replacements = 0
         for (const message of event.messages) replacements += sanitizeMessageText(message).replacements
+        for (const part of event.system) replacements += sanitizeMessageText(part).replacements
         if (replacements > 0) state.stats.redactedRequests++
       }
 
@@ -414,9 +501,16 @@ export default Plugin.define({
         state.stats.compactedCharacters += removed
       }
 
+      const currentTask = redactSecrets(latestUserText(event.messages as unknown[]))
+      const currentTaskFingerprint = stableID("task", `${event.sessionID}:${currentTask}`)
+      if (currentTask && activeTasks.get(event.sessionID) !== currentTaskFingerprint) {
+        usedSkills.delete(event.sessionID)
+        activeTasks.set(event.sessionID, currentTaskFingerprint)
+      }
+
       if (options.adaptivePlanning) {
-        const task = redactSecrets(latestUserText(event.messages as unknown[]))
-        const taskFingerprint = stableID("task", `${event.sessionID}:${task}`)
+        const task = currentTask
+        const taskFingerprint = currentTaskFingerprint
         if (task && plannedTasks.get(event.sessionID) !== taskFingerprint) {
           try {
             const models = await ctx.model.list()
@@ -461,21 +555,10 @@ export default Plugin.define({
         }
       }
 
-      const query = redactSecrets(latestUserText(event.messages as unknown[]))
-      const recallFingerprint = stableID("task", `${event.sessionID}:${query}`)
+      const query = currentTask
+      const recallFingerprint = currentTaskFingerprint
       if (!query || recalledTasks.get(event.sessionID) === recallFingerprint) return
       recalledTasks.set(event.sessionID, recallFingerprint)
-      if (selectedSkills.length) {
-        event.system.push({
-          type: "text",
-          text: [
-            "<adaptive-intelligence-skills>",
-            "Locally learned candidate procedures available for this task; load one only when its description clearly applies:",
-            ...selectedSkills.map((skill) => `- ${skill.id}: ${skill.description}`),
-            "</adaptive-intelligence-skills>",
-          ].join("\n"),
-        })
-      }
       if (options.recallCount === 0) return
       const recallState: AdaptiveState = sharedPreferences.length
         ? { ...state, memories: [...state.memories, ...sharedPreferences.filter((memory) => !state.memories.some((local) => local.id === memory.id))] }
@@ -526,6 +609,8 @@ export default Plugin.define({
 
     const learn = async (sessionID: string) => {
       if (!options.autoLearn || extracting.has(sessionID)) return
+      const failure = extractionFailures.get(sessionID)
+      if (failure && Date.now() < failure.retryAfter) return
       const messages = await ctx.session.context({ sessionID }) as unknown[]
       const fp = fingerprint(messages)
       const previous = state.sessions[sessionID]
@@ -593,6 +678,7 @@ export default Plugin.define({
           const edge: MemoryEdge = {
             id: stableID("edge", `${from}:${type}:${to}`), from, to, relation: type, confidence,
             confirmations: 1, contradictions: 0, active: true, projectID, sourceSession: sessionID,
+            confirmationRefs: [sessionID],
             createdAt: now, updatedAt: now,
           }
           addOrMergeEdge(state, edge, options.maxEdges)
@@ -649,6 +735,7 @@ export default Plugin.define({
           updatedAt: now,
         }
         state.stats.extractions++
+        extractionFailures.delete(sessionID)
         const sessionEntries = Object.entries(state.sessions)
         if (sessionEntries.length > 300) {
           sessionEntries.sort((a, b) => b[1].updatedAt.localeCompare(a[1].updatedAt))
@@ -658,6 +745,11 @@ export default Plugin.define({
         await saveSharedPreferences()
       } catch (error) {
         state.stats.extractionErrors++
+        const attempts = (extractionFailures.get(sessionID)?.attempts ?? 0) + 1
+        extractionFailures.set(sessionID, {
+          attempts,
+          retryAfter: Date.now() + Math.min(30 * 60_000, 15_000 * 2 ** Math.min(attempts - 1, 7)),
+        })
         await save()
         console.warn(`[adaptive-intelligence] learning skipped: ${error instanceof Error ? error.message : String(error)}`)
       } finally {
@@ -684,8 +776,12 @@ export default Plugin.define({
       skill.uses++
       skill.updatedAt = new Date().toISOString()
       skill.tier = computeSkillTier(skill, tierOptions)
-      const session = usedSkills.get(event.sessionID) ?? new Set<string>()
-      session.add(id)
+      const taskFingerprint = activeTasks.get(event.sessionID) ?? stableID("task", `${event.sessionID}:unplanned`)
+      const usage = usedSkills.get(event.sessionID)
+      const session = usage?.taskFingerprint === taskFingerprint
+        ? usage
+        : { taskFingerprint, ids: new Set<string>() }
+      session.ids.add(id)
       usedSkills.set(event.sessionID, session)
       writeLibrary()
       await save()
@@ -710,14 +806,14 @@ export default Plugin.define({
     })
 
     await ctx.session.hook("experimental.idle", async (event) => {
-      const ids = usedSkills.get(event.sessionID)
-      if (!ids?.size) return
+      const usage = usedSkills.get(event.sessionID)
+      if (!usage?.ids.size || activeTasks.get(event.sessionID) !== usage.taskFingerprint) return
       try {
         const messages = await ctx.session.context({ sessionID: event.sessionID }) as Array<Record<string, unknown>>
         const outcome = classifyVerifiedOutcome(messages)
         if (outcome === "inconclusive") return
         const failed = outcome === "failure"
-        for (const id of ids) {
+        for (const id of usage.ids) {
           const skill = library.find((candidate) => candidate.id === id)
           if (!skill) continue
           if (failed) skill.failures++

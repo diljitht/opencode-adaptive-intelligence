@@ -6,7 +6,7 @@ The plugin is designed to improve agent behavior without editing project source 
 
 ## Requirements
 
-- OpenCode V2 (`@opencode/plugin` 2.2.7 or compatible)
+- OpenCode V2 (`@opencode/plugin` 2.3.0 or compatible)
 - Node.js 20 or newer
 
 ## Features
@@ -60,7 +60,7 @@ Memories are:
 
 Recall uses lexical seed retrieval followed by at most two graph hops and diversity-aware reranking. Only a small, character-limited evidence block is added to model context. Recalled information is explicitly marked as evidence that must be verified against the current project.
 
-A model-proposed `supersedes` relationship must be independently confirmed before older evidence is excluded from normal recall. Access time, content-update time, and independent-confirmation time are tracked separately so recalling stale information does not make it appear newly verified.
+A model-proposed `supersedes` relationship must be confirmed by distinct session evidence before older evidence is excluded from normal recall. Repeated extraction from one session does not count as independent confirmation. Access time, content-update time, and independent-confirmation time are tracked separately so recalling stale information does not make it appear newly verified.
 
 ### Learned OpenCode skills
 
@@ -77,7 +77,7 @@ A reusable procedure may become a native OpenCode skill only when the session de
 Skills are learned by analyzing the problem at hand, then distilled and refined across iterations. They live in a **single shared library** in OpenCode's standard global skills directory so the same procedure is never researched from scratch twice.
 
 - The authoritative store is the standard global skills directory, `~/.config/opencode/skills/<id>/SKILL.md` (honoring `XDG_CONFIG_HOME`), indexed by the hidden manifest `~/.config/opencode/skills/.adaptive-intelligence.json`.
-- Every library skill is written to the standard skills directory. Skills selected for the current project are advertised to the model (`metadata.opencode/autoinvoke: true`); the rest stay registered but hidden (`false`). Skill visibility therefore reflects the project synced most recently.
+- Every library skill is written to the standard skills directory as a hidden durable entry. Skills selected for the current project are advertised through OpenCode's location-scoped native skill registry, avoiding cross-project visibility races and repeated prompt injection.
 - When a session reveals a reusable procedure that is not already in the library, a new skill is created from the analysis. When a procedure is already present (matched by id or by at least 60% text similarity), the richer version is **merged into the existing skill** instead of creating a duplicate: the better procedure wins, applicability tags and evidence are unioned, the version is bumped, and a short refinement history is kept.
 - Skills carry coarse **genre tags** derived deterministically from marker files and manifests (for example `node`, `typescript`, `react`, `python`, `django`, `rust`, `go`, `docker`). Extra tags can be supplied with `projectTags`.
 - Two tiers keep the library useful without flooding a project: skills remain quarantined in projects that produced or used them until repeated verified outcomes meet the configured success threshold. Only then may broadly useful skills be promoted to `common` and surfaced elsewhere. At most `maxSkills` are registered in one project.
@@ -106,7 +106,7 @@ It detects common forms of:
 
 Detected values are rejected from adaptive memories and learned skills. Existing adaptive state is scrubbed during startup.
 
-Providers are treated as local only when their provider ID is explicitly listed in `localProviders`. For all other providers, detected values are replaced with synthetic placeholders in primary, title, compaction, and background-learning model requests.
+Providers are treated as local only when their provider ID is explicitly listed in `localProviders`. For all other providers, detected values are replaced with synthetic placeholders in messages, system instructions, tool-call inputs, tool outputs, title, compaction, and background-learning model requests.
 
 Configured web, browser, HTTP, MCP, `curl`, and `wget` tool inputs receive equivalent pseudonymization before execution.
 
@@ -145,8 +145,7 @@ This copies the plugin into `~/.config/opencode/plugins/opencode-adaptive-intell
 (honoring `XDG_CONFIG_HOME`) and installs its production dependencies there.
 The result is standalone: the clone can be moved or deleted after setup.
 OpenCode discovers plugins in that directory automatically, so no
-`opencode.jsonc` edit is required. Restart OpenCode, or run `/reload`, if it is
-already running.
+`opencode.jsonc` edit is required. Run `/reload` if OpenCode is already running.
 
 Variants:
 
@@ -263,6 +262,8 @@ Example configuration:
 - Learned skills live in the standard global skills directory: `~/.config/opencode/skills/<id>/SKILL.md`, indexed by the hidden manifest `~/.config/opencode/skills/.adaptive-intelligence.json`. Every project reads and writes this same library. The manifest is hidden from skill discovery, and skills not selected for the current project are written with `opencode/autoinvoke: false` so OpenCode does not advertise them.
 - Version 1 and version 2 adaptive state is migrated to version 3 during startup.
 - Stores are bounded by the configured memory, edge, skill, decision, and session limits.
+- Learning failures use bounded exponential retry backoff instead of retrying at every idle event.
+- Skill manifests accept only path-safe plugin-owned IDs, reject symbolic-link destinations, and use atomic file replacement.
 - The plugin does not provide telemetry or upload its adaptive state to a separate service.
 - OpenCode's own persisted session history remains managed by OpenCode and is not rewritten by this plugin.
 

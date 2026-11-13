@@ -16,6 +16,7 @@ import {
   hybridSearchMemories,
   computeSkillTier,
   inferMemoryEdges,
+  isValidLibrarySkillID,
   librarySkillID,
   mergeLibrarySkill,
   memoriesContradict,
@@ -135,6 +136,14 @@ test("outcomes require explicit verification evidence", () => {
     }],
   }]
   assert.equal(classifyVerifiedOutcome(failingTest), "failure")
+  const tapSuccess = [{
+    role: "assistant",
+    content: [{
+      type: "tool", name: "shell", input: { command: "node --test" },
+      state: { status: "completed", output: "# tests 4\n# pass 4\n# fail 0" },
+    }],
+  }]
+  assert.equal(classifyVerifiedOutcome(tapSuccess), "success")
 })
 
 test("unsafe persistent instructions are rejected", () => {
@@ -237,6 +246,19 @@ test("nested tool output is pseudonymized for remote model requests", () => {
   assert.doesNotMatch(message.content[0]!.state.output, /abcdefghijklmnopqrstuvwxyz/)
 })
 
+test("nested tool inputs are pseudonymized for remote model requests", () => {
+  const message = {
+    content: [{
+      type: "tool",
+      input: { headers: { authorization: "Bearer abcdefghijklmnopqrstuvwxyz" } },
+      state: { status: "completed" },
+    }],
+  }
+  const scan = sanitizeMessageText(message)
+  assert.ok(scan.replacements > 0)
+  assert.doesNotMatch(JSON.stringify(message), /abcdefghijklmnopqrstuvwxyz/)
+})
+
 test("environment references are not mistaken for secret values", () => {
   const source = "api_key=env://OPENAI_API_KEY password=process.env.DB_PASSWORD"
   assert.equal(pseudonymizeSensitive(source).text, source)
@@ -299,6 +321,29 @@ test("library skill identifiers are stable and project-independent", () => {
   assert.equal(librarySkillID("Run Vitest!"), "adaptive-run-vitest")
   assert.equal(librarySkillID("Run Vitest!"), librarySkillID("run   vitest"))
   assert.equal(librarySkillID(""), "adaptive-learned-workflow")
+  assert.equal(isValidLibrarySkillID("adaptive-run-vitest"), true)
+  assert.equal(isValidLibrarySkillID("../../outside"), false)
+  assert.equal(isValidLibrarySkillID("other-skill"), false)
+})
+
+test("edge confirmations require distinct evidence sources", () => {
+  const state = emptyState()
+  const left = memory("left", "A failing authentication request")
+  const right = memory("right", "Reuse the authenticated cookie")
+  state.memories.push(left, right)
+  const now = new Date().toISOString()
+  const edge = {
+    id: "edge-distinct", from: left.id, to: right.id, relation: "solved-by" as const,
+    confidence: 0.8, confirmations: 1, contradictions: 0, active: true, projectID: "p1",
+    sourceSession: "session-1", confirmationRefs: ["session-1"], createdAt: now, updatedAt: now,
+  }
+  addOrMergeEdge(state, edge, 20)
+  addOrMergeEdge(state, { ...edge }, 20)
+  assert.equal(state.edges[0]?.confirmations, 1)
+  addOrMergeEdge(state, {
+    ...edge, sourceSession: "session-2", confirmationRefs: ["session-2"],
+  }, 20)
+  assert.equal(state.edges[0]?.confirmations, 2)
 })
 
 test("skill tiers require cross-project use and verified reliability", () => {
@@ -353,8 +398,9 @@ test("untrusted library manifests are validated and normalized", () => {
   const parsed = parseLibraryIndex({
     version: 1,
     skills: [
-      { id: "s", name: "S", content: "do it", tags: ["Node"], projectIDs: ["p9"], version: 2, uses: 4, successes: 3, failures: 0, tier: "common" },
+      { id: "adaptive-s", name: "S", content: "do it", tags: ["Node"], projectIDs: ["p9"], version: 2, uses: 4, successes: 3, failures: 0, tier: "common" },
       { id: "", name: "missing id", content: "x" },
+      { id: "../../outside", name: "unsafe", content: "x" },
     ],
   })
   assert.equal(parsed.skills.length, 1)

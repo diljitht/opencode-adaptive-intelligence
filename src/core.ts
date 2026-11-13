@@ -68,6 +68,8 @@ export interface MemoryEdge {
   active: boolean
   projectID: string
   sourceSession?: string
+  /** Distinct sessions/checkpoints that independently supported this edge. */
+  confirmationRefs?: string[]
   createdAt: string
   updatedAt: string
 }
@@ -175,6 +177,7 @@ export interface AdaptiveState {
     librarySkills: number
     libraryAdopted: number
     libraryRefinements: number
+    persistenceErrors: number
   }
 }
 
@@ -292,6 +295,7 @@ export function emptyState(): AdaptiveState {
       librarySkills: 0,
       libraryAdopted: 0,
       libraryRefinements: 0,
+      persistenceErrors: 0,
     },
   }
 }
@@ -580,6 +584,13 @@ export function sanitizeMessageText(message: unknown): { categories: SensitiveCa
     const record = value as Record<string, unknown>
     for (const key of ["text", "output", "result"]) sanitizeField(record, key)
     if (record.type === "tool") sanitizeField(record, "content")
+    for (const key of ["input", "arguments"]) {
+      if (!(key in record)) continue
+      const scan = pseudonymizeValue(record[key])
+      record[key] = scan.value
+      scan.categories.forEach((category) => categories.add(category))
+      replacements += scan.replacements
+    }
     if (record.state && typeof record.state === "object") sanitizePart(record.state)
   }
   const record = message as Record<string, unknown>
@@ -657,9 +668,23 @@ export function classifyVerifiedOutcome(messages: unknown[]): Exclude<DecisionOu
       const isVerification = /\b(?:test|vitest|jest|pytest|cargo test|go test|typecheck|tsc|build|lint|verify|check)\b/i.test(serialized)
       if (!isVerification) continue
       const output = `${state.output ?? ""} ${state.result ?? ""}`
+      const exitCode = Number(
+        state.exitCode ??
+        (state.metadata && typeof state.metadata === "object"
+          ? (state.metadata as Record<string, unknown>).exitCode
+          : Number.NaN),
+      )
       if (state.status === "error" || /\b(?:tests? failed|verification failed|[1-9]\d* failures?|exit code [1-9]\d*)\b/i.test(output)) {
         outcome = "failure"
-      } else if (state.status === "completed" && /\b(?:tests? passed|verification passed|build (?:passed|succeeded)|typecheck passed|0 failures?|exit code 0|success)\b/i.test(output)) {
+      } else if (state.status === "completed" && (
+        exitCode === 0 ||
+        /\b(?:tests? passed|verification passed|build (?:passed|succeeded)|typecheck passed|0 failures?|exit code 0|success)\b/i.test(output) ||
+        /(?:^|\n)\s*#\s*pass\s+[1-9]\d*\b/i.test(output) ||
+        /\b[1-9]\d*\s+passed(?:,\s*\d+\s+(?:skipped|deselected))?\b/i.test(output) ||
+        /\bTests:\s*(?:\d+\s+skipped,\s*)?\d+\s+passed\b/i.test(output) ||
+        /\btest result:\s*ok\b/i.test(output) ||
+        /(?:^|\n)\s*ok\s+(?:\S+\/)*\S+/i.test(output)
+      )) {
         outcome = "success"
       }
     }
@@ -707,13 +732,19 @@ export function addOrMergeMemory(
     (memory.id === candidate.id || memorySimilarity(memory, candidate) >= 0.78),
   )
   if (duplicate) {
+    const previousRefs = new Set(duplicate.sourceRefs ?? [])
+    const incomingRefs = candidate.sourceRefs ?? []
+    const hasNewEvidence = incomingRefs.some((ref) => !previousRefs.has(ref))
     if (candidate.text.length > duplicate.text.length && candidate.confidence >= duplicate.confidence) {
       duplicate.text = candidate.text
       duplicate.keywords = candidate.keywords
       duplicate.kind = candidate.kind
       duplicate.contentUpdatedAt = candidate.contentUpdatedAt ?? candidate.updatedAt
     }
-    duplicate.confidence = Math.min(1, Math.max(duplicate.confidence, candidate.confidence) + 0.03)
+    duplicate.confidence = Math.min(
+      1,
+      Math.max(duplicate.confidence, candidate.confidence) + (hasNewEvidence ? 0.03 : 0),
+    )
     duplicate.updatedAt = candidate.updatedAt
     duplicate.lastConfirmedAt = candidate.lastConfirmedAt ?? duplicate.lastConfirmedAt
     duplicate.sourceRefs = [...new Set([...(duplicate.sourceRefs ?? []), ...(candidate.sourceRefs ?? [])])].slice(-20)
@@ -796,8 +827,14 @@ export function addOrMergeEdge(state: AdaptiveState, candidate: MemoryEdge, maxE
     edge.from === candidate.from && edge.to === candidate.to && edge.relation === candidate.relation,
   )
   if (existing) {
-    existing.confidence = Math.min(1, Math.max(existing.confidence, candidate.confidence) + 0.02)
-    existing.confirmations++
+    const reference = candidate.confirmationRefs?.[0] ?? candidate.sourceSession
+    const known = new Set(existing.confirmationRefs ?? (existing.sourceSession ? [existing.sourceSession] : []))
+    const independentlyConfirmed = !reference || !known.has(reference)
+    if (independentlyConfirmed) {
+      existing.confidence = Math.min(1, Math.max(existing.confidence, candidate.confidence) + 0.02)
+      existing.confirmations++
+      if (reference) existing.confirmationRefs = [...known, reference].slice(-20)
+    }
     existing.active = true
     existing.updatedAt = candidate.updatedAt
     applyTemporalEffect(state, existing)
@@ -930,7 +967,8 @@ export function inferMemoryEdges(
     const before = state.edges.length
     addOrMergeEdge(state, {
       id: stableID("edge", `${from.id}:${relation}:${to.id}`), from: from.id, to: to.id, relation, confidence,
-      confirmations: 1, contradictions: 0, active: true, projectID, sourceSession: sessionID, createdAt: now, updatedAt: now,
+      confirmations: 1, contradictions: 0, active: true, projectID, sourceSession: sessionID,
+      confirmationRefs: [sessionID], createdAt: now, updatedAt: now,
     }, maxEdges)
     if (state.edges.length > before) added++
   }
@@ -1011,6 +1049,11 @@ export function parseGeneratedJSON(text: string): Record<string, unknown> | null
 export function librarySkillID(input: string): string {
   const clean = input.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 42) || "learned-workflow"
   return `adaptive-${clean}`
+}
+
+/** Restrict filesystem-backed skill IDs to portable, path-safe identifiers. */
+export function isValidLibrarySkillID(id: string): boolean {
+  return id.length <= 64 && /^adaptive-[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id)
 }
 
 /** Token-overlap (Jaccard) similarity between two free-text fields; 0 when either is empty. */
@@ -1354,7 +1397,7 @@ export function parseLibraryIndex(value: unknown): LibraryIndex {
     const id = typeof skill.id === "string" ? skill.id : ""
     const name = typeof skill.name === "string" ? skill.name : ""
     const content = typeof skill.content === "string" ? skill.content : ""
-    if (!id || !name || !content) continue
+    if (!isValidLibrarySkillID(id) || !name || !content) continue
     const createdAt = typeof skill.createdAt === "string" ? skill.createdAt : new Date(0).toISOString()
     const updatedAt = typeof skill.updatedAt === "string" ? skill.updatedAt : createdAt
     const projectID = typeof skill.projectID === "string" ? skill.projectID : ""
@@ -1406,9 +1449,19 @@ export function parseSkillMarkdown(
   const front = match[1] ?? ""
   const content = (match[2] ?? "").trim()
   const metadata: Record<string, string> = {}
+  const parseScalar = (value: string): string => {
+    const trimmed = value.trim()
+    if (!trimmed.startsWith('"')) return trimmed
+    try {
+      const parsed = JSON.parse(trimmed)
+      return typeof parsed === "string" ? parsed : trimmed
+    } catch {
+      return trimmed
+    }
+  }
   for (const line of front.split(/\r?\n/)) {
     const entry = /^\s*([A-Za-z0-9_-]+):[ \t]*(.*)$/.exec(line)
-    if (entry?.[1]) metadata[entry[1]] = (entry[2] ?? "").trim()
+    if (entry?.[1]) metadata[entry[1]] = parseScalar(entry[2] ?? "")
   }
   const name = metadata.name ?? ""
   if (!name || !content) return null

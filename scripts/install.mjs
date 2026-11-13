@@ -132,7 +132,7 @@ try {
 console.log(`Installed standalone plugin at ${target}`)
 console.log("")
 console.log("OpenCode discovers plugins in this directory automatically.")
-console.log("Restart OpenCode, or run /reload, if it is already running.")
+console.log("Run /reload if OpenCode is already running.")
 console.log("The cloned repository is no longer required for the installed plugin.")
 console.log("Run `npm run setup` again after pulling updates.")
 console.log("Optional settings can be added to opencode.json(c) as a plugins entry")
